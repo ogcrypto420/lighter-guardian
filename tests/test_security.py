@@ -146,6 +146,7 @@ def test_detail_levels():
                 async def __aenter__(s): return s
                 async def __aexit__(s, *a): pass
                 async def json(s, **k): return {"ok": True}
+                async def text(s): return '{"ok": true}'
             return R()
     tg = G.Telegram(Raw(), "123:tok", "42", detail="short")
     asyncio.run(tg.send(msg))
@@ -190,6 +191,7 @@ def test_send_tx_format_and_nonce_retry():
         async def __aenter__(s): return s
         async def __aexit__(s, *a): pass
         async def json(s, **k): return s.data
+        async def text(s): return json.dumps(s.data)
 
     class Http:
         def get(self, url, params=None, **kw):

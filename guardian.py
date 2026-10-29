@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -93,6 +94,7 @@ NETWORKS = {
                 300, "CORE-TEST"),
 }
 TELEGRAM_HOST = "api.telegram.org"
+WS_SILENCE_SEC = 20          # WebSocket молчит столько (а цены и pong приходят постоянно) — переподключаемся
 # Единственные адреса, куда страж может ходить в сеть
 ALLOWED_HOSTS = {urlsplit(u).hostname for net in NETWORKS.values() for u in net[:2]} | {TELEGRAM_HOST}
 
@@ -115,6 +117,12 @@ class Config:
     # мягкий стоп не закрывает сам, если стакан шире этого (%): только алерт — защита от «дыр» в тонком стакане
     soft_stop_max_spread_pct: float = env_float("SOFT_STOP_MAX_SPREAD_PCT", 2.0)
     retry_pause_sec: float = env_float("EMERGENCY_RETRY_PAUSE_SEC", 60)   # пауза после неудачного закрытия
+    # Сверка с биржей по REST (ордера и позиции) — подстраховка к WebSocket, который и так приходит мгновенно.
+    # Lighter ограничивает обычные аккаунты 60 запросами в минуту, поэтому сверка тратит не больше бюджета,
+    # а остальное остаётся на закрытие позиций и отмену ордеров.
+    sync_sec: float = env_float("ORDERS_SYNC_SEC", 10)
+    rest_budget: float = env_float("REST_BUDGET_PER_MIN", 20)
+    stale_alert_sec: float = env_float("STALE_ALERT_SEC", 30)            # нет данных от биржи столько — сообщение
 
 
 SL_TYPES = {"stop-loss", "stop-loss-limit"}
@@ -315,11 +323,12 @@ class Guardian:
                                                          f"Триггер {num(o.trigger_price)}.", "failed_stop"))
         return actions
 
-    def sync_orders(self, mid: int, orders: list[Order], now: float | None = None) -> list[tuple]:
+    def sync_orders(self, mid: int, orders: list[Order], now: float | None = None,
+                    force: bool = False) -> list[tuple]:
         """Сверка ордеров одного рынка по REST: убирает «призраков» (если событие отмены потерялось)
         и ловит стоп, который исчез, хотя цена уже за ним."""
         now = time.time() if now is None else now
-        if now - self.orders_ts.get(mid, 0) < 5:
+        if not force and now - self.orders_ts.get(mid, 0) < 5:
             return []                     # по WebSocket только что пришло свежее — REST может отставать
         others = {i: o for i, o in self.orders.items() if o.market != mid}
         new = {**others, **{o.index: o for o in orders if o.active and o.market == mid}}
@@ -432,11 +441,33 @@ class Guardian:
                 elif kind == "cleanup":
                     await self.do_cleanup(mid, payload, mode)
                 elif kind == "emergency":
+                    if scenario == "soft_stop" and mode == "act" and not self.cfg.dry_run \
+                            and not await self.stop_still_there(mid):
+                        continue
                     await self.emergency_close(mid, payload, mode)
             except Exception as e:  # noqa: BLE001
                 log.exception("Ошибка при выполнении %s", kind)
                 await self.notify(f"❗ {self.sym(mid)}: ошибка при попытке действия ({kind}): "
                                   f"{S(html.escape(redact(str(e))))}")
+
+    async def stop_still_there(self, mid: int) -> bool:
+        """Перед «мягким» закрытием — один запрос к бирже: стоп ещё стоит? Если его сняли, а событие
+        не дошло, закрывать не нужно. Если пропал, а mark уже за триггером, — это сработавший стоп (закроем)."""
+        fetch = getattr(self.ex, "fetch_active_orders", None)
+        if fetch is None:
+            return True
+        try:
+            orders = await fetch(mid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: проверка стопа: %s", self.ex.label, redact(str(e)))
+            return True               # не смогли проверить — действуем по тому, что видим
+        if orders is None:
+            return True
+        self.spawn(self.sync_orders(mid, orders, force=True))
+        if self.stops_for(mid, self.positions.get(mid, 0.0)):
+            return True
+        log.info("%s: стоп по %s уже снят — мягкое закрытие отменено", self.ex.label, mid)
+        return False
 
     def _prefix(self, mode: str) -> str:
         if mode == "alert":
@@ -553,6 +584,25 @@ class Guardian:
 
 # ───────────────────────────── биржа Lighter ─────────────────────────────
 
+class RateLimited(RuntimeError):
+    """Биржа ограничила частоту запросов (HTTP 429/405)."""
+
+
+async def read_json(r):
+    """Ответ биржи: JSON, а если пришло что-то другое (например, страница ошибки) — не падаем."""
+    text = await r.text()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"message": text[:200]}
+
+
+def sync_interval(open_positions: int, cfg: Config) -> float:
+    """Как часто сверяться по REST: чем больше открытых позиций, тем больше запросов за раз —
+    интервал растёт, чтобы сверка укладывалась в бюджет REST_BUDGET_PER_MIN."""
+    return max(cfg.sync_sec, (1 + open_positions) * 60 / max(cfg.rest_budget, 1))
+
+
 class LighterExchange:
     """REST + WebSocket Lighter. Транзакции подписываются локально (lighter_signer), отправляются нашим кодом."""
 
@@ -577,15 +627,23 @@ class LighterExchange:
         self.last_msg = time.time()         # когда последний раз что-то пришло по WebSocket
         self.sub_error = ""                 # биржа отказала в подписке на ордера/позиции
         self._token: tuple[str, float] = ("", 0.0)
+        self.calls: deque[float] = deque(maxlen=2000)     # время REST-запросов — чтобы не упереться в лимит биржи
 
     def _timeout(self, total: float = 20):
         import aiohttp
         return aiohttp.ClientTimeout(total=total)
 
+    def calls_last_min(self) -> int:
+        cut = time.time() - 60
+        return sum(1 for t in self.calls if t > cut)
+
     async def get(self, path: str, headers: dict | None = None, **params):
+        self.calls.append(time.time())
         async with self.http.get(f"{self.api_url}/api/v1/{path}", params=params, headers=headers,
                                  proxy=self.proxy, timeout=self._timeout()) as r:
-            data = await r.json(content_type=None)
+            data = await read_json(r)
+            if r.status in (429, 405):
+                raise RateLimited(f"{path}: биржа ограничила частоту запросов (HTTP {r.status})")
             if r.status >= 400:
                 raise RuntimeError(f"{path}: HTTP {r.status} {data}")
             return data
@@ -613,10 +671,11 @@ class LighterExchange:
         params = {"account_index": self.account_index}
         if self.markets:
             params["market_id"] = min(self.markets)
+        self.calls.append(time.time())
         async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders", params=params,
                                  headers={"authorization": token}, proxy=self.proxy,
                                  timeout=self._timeout()) as r:
-            data = await r.json(content_type=None)
+            data = await read_json(r)
         if r.status >= 400 or (isinstance(data, dict) and int(data.get("code", 200)) != 200):
             msg = data.get("message") if isinstance(data, dict) else data
             raise RuntimeError(f"API-ключ {self.api_key_index} не подходит к аккаунту {self.account_index} "
@@ -642,11 +701,12 @@ class LighterExchange:
 
     async def fetch_active_orders(self, mid: int) -> list[Order] | None:
         """Активные ордера одного рынка по REST (для сверки). None — если биржа не ответила как надо."""
+        self.calls.append(time.time())
         async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
                                  params={"account_index": self.account_index, "market_id": mid},
                                  headers={"authorization": self.rest_token()}, proxy=self.proxy,
                                  timeout=self._timeout()) as r:
-            data = await r.json(content_type=None)
+            data = await read_json(r)
         if r.status >= 400 or not isinstance(data, dict) or int(data.get("code", 200)) != 200 \
                 or not isinstance(data.get("orders"), list):
             return None
@@ -662,23 +722,40 @@ class LighterExchange:
 
     async def _send(self, build) -> tuple[bool, str]:
         """build(nonce) → (tx_type, tx_info). Подпись локально, отправка POST /api/v1/sendTx.
-        Если биржа отвергла nonce — один повтор со свежим nonce."""
+        Если биржа отвергла nonce — один повтор со свежим nonce; если ограничила частоту (429) — до 3 повторов
+        с паузой: закрытие позиции не должно сорваться из-за лимита запросов."""
         async with self._tx_lock:
-            for attempt in range(2):
-                tx_type, tx_info = build(await self._nonce())
+            nonce_retry, rate_retry = 1, 3
+            while True:
+                try:
+                    nonce = await self._nonce()
+                except RateLimited:
+                    if rate_retry:
+                        rate_retry -= 1
+                        await asyncio.sleep(2)
+                        continue
+                    return False, "биржа ограничила частоту запросов (429)"
+                tx_type, tx_info = build(nonce)
+                self.calls.append(time.time())
                 async with self.http.post(f"{self.api_url}/api/v1/sendTx",
                                           data={"tx_type": str(tx_type), "tx_info": tx_info},
                                           headers={"Accept": "application/json"},
                                           proxy=self.proxy, timeout=self._timeout()) as r:
-                    data = await r.json(content_type=None)
+                    data = await read_json(r)
+                if r.status in (429, 405):
+                    if rate_retry:
+                        rate_retry -= 1
+                        await asyncio.sleep(2)
+                        continue
+                    return False, "биржа ограничила частоту запросов (429)"
                 code = int(data.get("code", r.status)) if isinstance(data, dict) else r.status
                 if r.status < 400 and code == 200:
                     return True, ""
                 msg = str(data.get("message") if isinstance(data, dict) else data)
-                if attempt == 0 and "nonce" in msg.lower():
+                if nonce_retry and "nonce" in msg.lower():
+                    nonce_retry -= 1
                     continue
                 return False, redact(msg or f"HTTP {r.status}")
-        return False, "nonce"
 
     async def cancel_order(self, mid: int, order_index: int) -> tuple[bool, str]:
         return await self._send(lambda n: self.signer.cancel_order(mid, order_index, n))
@@ -747,15 +824,15 @@ class LighterExchange:
                     last_ping = time.time()
                     while time.time() < deadline:
                         try:
-                            msg = await ws.receive(timeout=20)
+                            msg = await ws.receive(timeout=5)
                         except asyncio.TimeoutError:
                             msg = None
-                        if time.time() - last_ping > 50:
+                        if time.time() - last_ping > 10:          # биржа отвечает pong — так видно, что связь жива
                             await ws.send_json({"type": "ping"})
                             last_ping = time.time()
                         if msg is None:
-                            if time.time() - self.last_msg > 90:     # соединение «висит» молча
-                                log.warning("%s: WebSocket молчит 90 с — переподключаюсь", self.label)
+                            if time.time() - self.last_msg > WS_SILENCE_SEC:     # соединение «висит» молча
+                                log.warning("%s: WebSocket молчит %d с — переподключаюсь", self.label, WS_SILENCE_SEC)
                                 break
                             continue
                         self.last_msg = time.time()
@@ -1092,9 +1169,13 @@ class Runner:
             await asyncio.sleep(0.25)
 
     async def reconcile(self, g: Guardian) -> None:
-        """Раз в 30 с — сверка с биржей по REST: позиции и ордера рынков с открытыми позициями."""
+        """Сверка с биржей по REST (раз в ORDERS_SYNC_SEC, но в пределах бюджета запросов):
+        позиции и ордера рынков с открытыми позициями. Основной поток — WebSocket, это подстраховка."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(sync_interval(sum(1 for p in g.positions.values() if p != 0), self.cfg))
+            busy = getattr(g.ex, "calls_last_min", lambda: 0)()
+            if busy >= self.cfg.rest_budget * 2:
+                continue        # сейчас идут закрытия/отмены — не отнимаем у них лимит запросов биржи
             try:
                 await g.ex.refresh_positions()
             except Exception as e:  # noqa: BLE001
@@ -1112,14 +1193,14 @@ class Runner:
         """Сообщает, если страж «ослеп»: нет данных от биржи или биржа не даёт подписку на ордера."""
         ex, down, seen_err = g.ex, False, ""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
             try:
                 silent = time.time() - ex.last_msg
-                if silent > 120 and not down:
+                if silent > self.cfg.stale_alert_sec and not down:
                     down = True
                     await self.tg.send(f"❗ <b>{html.escape(ex.label)}</b>: нет данных от биржи уже {silent:.0f} с — "
                                        "страж сейчас не видит позиции. Переподключаюсь…")
-                elif silent < 60 and down:
+                elif silent < 10 and down:
                     down = False
                     await self.tg.send(f"✅ <b>{html.escape(ex.label)}</b>: связь с биржей восстановлена.")
                 if ex.sub_error and ex.sub_error != seen_err:

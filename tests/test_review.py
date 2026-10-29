@@ -388,6 +388,102 @@ def test_hedge_no_price_no_blind_close():
     print("18. вилка: без цены в стакане вторую ногу «вслепую» не закрываем, а просим сделать вручную ✓")
 
 
+def test_sync_interval_budget():
+    cfg = G.Config()
+    cfg.sync_sec, cfg.rest_budget = 10, 20
+    got = [G.sync_interval(n, cfg) for n in (0, 1, 3, 9)]
+    assert got == [10, 10, 12, 30], got                 # больше позиций — реже, но в пределах 20 запросов/мин
+    for n in (0, 1, 3, 9, 20):
+        assert (1 + n) * 60 / G.sync_interval(n, cfg) <= 20 + 1e-9
+    print("19. сверка по REST укладывается в бюджет запросов (лимит Lighter — 60 в минуту) ✓")
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    async def text(self):
+        return self.body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def test_send_retries_on_rate_limit():
+    class Http:
+        def __init__(self):
+            self.posts = 0
+
+        def get(self, url, **kw):
+            return _Resp(200, '{"code": 200, "nonce": 5}')
+
+        def post(self, url, **kw):
+            self.posts += 1
+            return _Resp(429, "Too Many Requests") if self.posts == 1 else _Resp(200, '{"code": 200}')
+    ex = G.LighterExchange(Http(), "robinhood", 7, 4, "0x00")
+    orig = asyncio.sleep
+
+    async def fast(s):
+        await orig(0)
+    G.asyncio.sleep = fast
+    try:
+        ok, err = run(ex._send(lambda n: (14, "{}")))
+    finally:
+        G.asyncio.sleep = orig
+    assert ok and ex.http.posts == 2 and ex.calls_last_min() == 4, (ok, err, ex.http.posts, ex.calls_last_min())
+    print("20. биржа ответила 429 — заявка на закрытие повторяется с паузой, а не теряется ✓")
+
+
+def test_soft_stop_checks_stop_before_closing():
+    for rest_orders, expect_close in (([], False), ([sl(1, 210)], True)):
+        g, ex, sent = make()
+        g.on_positions({15: 2.0}, now=0)
+        g.on_orders([sl(1, 210)], snapshot=True)
+        now = time.time()
+        g.on_quote(15, 209.0, 209.2, 211.0, now=now)      # mark ещё выше стопа (как на pre-IPO)
+        ex.book = 209.0
+
+        async def fetch(mid, orders=rest_orders):
+            return orders
+        ex.fetch_active_orders = fetch
+        run(g.run_actions([("emergency", 15, "Стоп не сработал", "soft_stop")]))
+        assert bool(ex.closes) == expect_close, (rest_orders, ex.closes)
+    print("21. перед «мягким» закрытием страж проверяет на бирже, что стоп ещё стоит ✓")
+
+
+def test_health_alerts_after_30s():
+    sent = []
+
+    async def send(t):
+        sent.append(G.strip_marks(t))
+    cfg = G.Config()
+    r = G.Runner(types.SimpleNamespace(send=send), cfg)
+    ex = types.SimpleNamespace(label="#1 RH", last_msg=time.time() - 31, sub_error="")
+    g = types.SimpleNamespace(ex=ex)
+    n = {"i": 0}
+    orig = asyncio.sleep
+
+    async def fake_sleep(s):
+        n["i"] += 1
+        if n["i"] == 2:
+            ex.last_msg = time.time()                       # связь вернулась
+        if n["i"] > 2:
+            raise asyncio.CancelledError
+    G.asyncio.sleep = fake_sleep
+    try:
+        run(r.health(g))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        G.asyncio.sleep = orig
+    assert len(sent) == 2 and "нет данных от биржи уже 3" in sent[0] and "восстановлена" in sent[1], sent
+    assert cfg.stale_alert_sec == 30 and G.WS_SILENCE_SEC == 20
+    print("22. нет данных от биржи 30 с — сообщение (раньше 2 мин), WebSocket переподключается через 20 с ✓")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

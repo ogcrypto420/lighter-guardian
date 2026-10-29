@@ -1,5 +1,6 @@
 """Тесты нумерованных кошельков: вилки внутри кошелька и команды Telegram.  python -m tests.test_wallets"""
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -143,6 +144,7 @@ def test_wallet_proxies():
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
         async def json(self, **k): return {"code": 200, "order_book_details": []}
+        async def text(self): return json.dumps({"code": 200, "order_book_details": []})
 
     class Http:
         def get(self, url, **kw):  # noqa: D401

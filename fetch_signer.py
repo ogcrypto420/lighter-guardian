@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 from lighter_signer import SIGNER_COMMIT, SIGNER_DIR, SIGNER_FILES, platform_key, sha256_file
@@ -19,16 +20,26 @@ BASE = f"https://raw.githubusercontent.com/elliottech/lighter-python/{SIGNER_COM
 
 def fetch(name: str, sha: str) -> None:
     dest = SIGNER_DIR / name
-    if dest.exists() and sha256_file(dest) == sha:
-        print(f"✓ {name} уже на месте, хэш совпадает")
-        return
+    if dest.exists():
+        if sha256_file(dest) == sha:
+            print(f"✓ {name} уже на месте, SHA-256 совпадает")
+            return
+        print(f"⚠️ {name} на месте, но SHA-256 не совпадает — скачиваю заново")
     SIGNER_DIR.mkdir(parents=True, exist_ok=True)
     print(f"↓ {name} …")
     fd, tmp = tempfile.mkstemp(dir=SIGNER_DIR, prefix=".dl-")
     try:
-        with os.fdopen(fd, "wb") as f, urllib.request.urlopen(BASE + name, timeout=120) as r:
-            while chunk := r.read(1 << 20):
-                f.write(chunk)
+        try:
+            with os.fdopen(fd, "wb") as f, urllib.request.urlopen(BASE + name, timeout=120) as r:
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+        except (urllib.error.URLError, OSError) as e:
+            raise SystemExit(
+                f"❌ Не удалось скачать {name}: {getattr(e, 'reason', e)}\n"
+                f"Можно скачать вручную: https://github.com/elliottech/lighter-python/blob/{SIGNER_COMMIT}"
+                f"/lighter/signers/{name}\n"
+                f"Положи файл в папку {SIGNER_DIR} и запусти python fetch_signer.py ещё раз: он проверит SHA-256."
+            ) from None
         actual = sha256_file(tmp)
         if actual != sha:
             raise SystemExit(f"❌ {name}: SHA-256 не совпадает ({actual}), файл не сохранён.")

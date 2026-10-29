@@ -35,13 +35,13 @@ class Ex:
         pass
 
 
-def setup(dry=False, mode="act"):
+def setup(dry=False, mode="act", debounce=0.7):
     msgs = []
 
     async def notify(t):
         msgs.append(G.strip_marks(t))
     cfg = G.Config()
-    cfg.dry_run, cfg.hedge, cfg.hedge_debounce = dry, mode, 0.7
+    cfg.dry_run, cfg.hedge, cfg.hedge_debounce = dry, mode, debounce
     rh = Ex("RH", {15: G.Market(15, "NVDA", 4, 2), 37: G.Market(37, "SKHY", 4, 2)})
     core = Ex("CORE", {115: G.Market(115, "NVDA", 3, 3), 143: G.Market(143, "SKHYNIX", 3, 4),
                        117: G.Market(117, "META", 3, 2)})
@@ -176,6 +176,30 @@ def test_naked_suppressed_for_hedge():
     acts = gs["RH"].tick(now=1000)
     assert not any("без стоп-лосса" in str(a) for a in acts)
     print("7. ноги вилки без стопа не считаются «голыми» ✓")
+
+
+def test_ten_second_pause():
+    assert G.Config().hedge_debounce == 10                # по умолчанию — 10 секунд
+    hm, gs, rh, core, msgs = setup(debounce=10)
+    gs["RH"].on_positions({15: 10.0}, now=1)
+    gs["CORE"].on_positions({115: -10.0}, now=1)
+    go(hm, 2)
+    gs["RH"].on_positions({15: 0.0}, now=20)          # стоп на RH
+    assert go(hm, 20.1) == [] and go(hm, 25) == [] and go(hm, 30.0) == [] and core.sent == []
+    go(hm, 30.2)
+    assert core.sent and core.sent[0][:2] == (115, 10.0), core.sent
+    # вторая нога закрылась сама за время паузы — страж её не трогает
+    hm, gs, rh, core, msgs = setup(debounce=10)
+    gs["RH"].on_positions({15: 10.0}, now=1)
+    gs["CORE"].on_positions({115: -10.0}, now=1)
+    go(hm, 2)
+    gs["RH"].on_positions({15: 0.0}, now=20)          # стоп на RH
+    go(hm, 21)
+    gs["CORE"].on_positions({115: 0.0}, now=24)       # через 4 с сработал тейк на CORE
+    for t in (25, 31, 35, 40):
+        go(hm, t)
+    assert core.sent == [] and rh.sent == [], (core.sent, rh.sent)
+    print("8. пауза 10 с перед закрытием второй ноги; закрылась сама — не трогаем ✓")
 
 
 if __name__ == "__main__":

@@ -2,18 +2,18 @@
 """
 Lighter Guardian — страж позиций на Lighter (Robinhood Chain и основной Lighter).
 
-Следит за твоим аккаунтом и подстраховывает стоп-лоссы:
+  1. Позиция закрылась → отменяет оставшиеся TP/SL по этой паре.
+  2. Стоп сработал, но биржа его отменила (проскальзывание / нет ликвидности) → закрывает позицию.
+  3. Цена в стакане за стопом, а стоп не исполнился → через N секунд закрывает позицию.
+  4. Позиция без стопа → предупреждает.
+  5. Вилка RH ↔ CORE: одна нога закрылась/уменьшилась → вторая закрывается/подрезается (hedge.py).
 
-  1. Позиция закрылась (по стопу, тейку или вручную) → отменяет оставшиеся TP/SL по этой паре,
-     чтобы старые ордера не сработали потом на новой позиции.
-  2. Стоп сработал, но биржа его отменила (слишком большое проскальзывание / нет ликвидности)
-     → сразу закрывает позицию рыночной reduce-only заявкой.
-  3. Цена в стакане ушла за стоп, а стоп так и не исполнился (mark price не дошёл до триггера
-     или стоп-лимит повис) → через N секунд закрывает позицию сам.
-  4. Позиция без стопа → предупреждает в Telegram.
-
-Работает с ТВОИМ API-ключом. Ключ хранится только у тебя (в .env / секретах), никуда не отправляется.
-По умолчанию включён режим DRY_RUN — страж только пишет, что СДЕЛАЛ БЫ, и ничего не отправляет на биржу.
+Безопасность:
+  • все ключи, адреса, прокси и токен Telegram — в зашифрованном хранилище (vault.py), пароль не сохраняется;
+  • транзакции подписываются локально официальным модулем Lighter (проверка SHA-256, без доступа к сети);
+  • в сеть программа ходит только на адреса Lighter и Telegram (белый список);
+  • секреты вымарываются из логов и сообщений; дампы памяти процесса запрещены;
+  • в Telegram по умолчанию уходят уведомления без цифр (TG_DETAIL=short).
 """
 from __future__ import annotations
 
@@ -24,15 +24,20 @@ import logging
 import math
 import os
 import re
+import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from security import S, T, register_secret, redact, render, strip_marks  # noqa: F401  (strip_marks — для тестов)
 
 log = logging.getLogger("guardian")
 HERE = Path(__file__).resolve().parent
 
 
 # ───────────────────────────── конфиг ─────────────────────────────
+# .env — только поведение (сценарии, пороги). Ключи и данные кошельков — в зашифрованном хранилище.
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -48,16 +53,18 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(HERE / ".env")
 
-# Прокси для всего трафика стража (Lighter REST/WebSocket, подпись SDK, Telegram).
-# Формат: http://user:pass@host:port  (поддерживаются HTTP/HTTPS-прокси)
-PROXY = os.getenv("PROXY", "").strip()
-if PROXY:
-    for _k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
-        os.environ[_k] = PROXY      # SDK Lighter и его модуль подписи берут прокси из окружения
+SECRETS: dict[str, str] = {}      # заполняется из хранилища при запуске; в os.environ не попадает
 
 
 def env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+    v = SECRETS.get(name)
+    if v is None:
+        v = os.getenv(name, default)
+    return (v or "").strip()
+
+
+def env_names() -> set[str]:
+    return set(SECRETS) | set(os.environ)
 
 
 def env_float(name: str, default: float) -> float:
@@ -82,6 +89,9 @@ NETWORKS = {
     "mainnet": ("https://mainnet.zklighter.elliot.ai", "wss://mainnet.zklighter.elliot.ai/stream", 304, "CORE"),
     "testnet": ("https://testnet.zklighter.elliot.ai", "wss://testnet.zklighter.elliot.ai/stream", 300, "CORE-TEST"),
 }
+TELEGRAM_HOST = "api.telegram.org"
+# Единственные адреса, куда страж может ходить в сеть
+ALLOWED_HOSTS = {urlsplit(u).hostname for net in NETWORKS.values() for u in net[:2]} | {TELEGRAM_HOST}
 
 
 @dataclass
@@ -176,12 +186,17 @@ class Quote:
 
 
 def mask_proxy(p: str) -> str:
-    """http://user:pass@host:port → host:port (пароль в логи и Telegram не попадает)."""
+    """http://user:pass@host:port → host:port (пароль никуда не попадает)."""
     return re.sub(r"^\w+://", "", re.sub(r"//[^@/]*@", "//", p)) if p else ""
 
 
 def fmt(x: float, nd: int = 4) -> str:
     return f"{x:.{nd}f}".rstrip("0").rstrip(".") if x else "0"
+
+
+def num(x: float, nd: int = 4) -> str:
+    """Число, которое скрывается в уведомлениях с TG_DETAIL=short/minimal."""
+    return S(fmt(x, nd))
 
 
 # ───────────────────────────── логика стража ─────────────────────────────
@@ -219,7 +234,7 @@ class Guardian:
     # ---------- вспомогательное ----------
     def sym(self, mid: int) -> str:
         m = self.ex.markets.get(mid)
-        return f"{m.symbol if m else mid} · {self.ex.label}"
+        return f"{T(m.symbol if m else mid)} · {self.ex.label}"
 
     def mode(self, scenario: str) -> str:
         m = getattr(self.cfg, scenario)
@@ -282,7 +297,7 @@ class Guardian:
                     actions.append(("emergency", o.market, f"Стоп сработал, но {reason}", "failed_stop"))
                 else:
                     actions.append(("alert", o.market, f"⚠️ {self.sym(o.market)}: {reason}. "
-                                                         f"Триггер {fmt(o.trigger_price)}.", "failed_stop"))
+                                                         f"Триггер {num(o.trigger_price)}.", "failed_stop"))
         return actions
 
     def on_quote(self, mid: int, bid: float, ask: float, mark: float, now: float | None = None) -> None:
@@ -317,7 +332,7 @@ class Guardian:
                     if now - since >= self.cfg.naked_alert_min * 60 and mid not in self.naked_alerted:
                         self.naked_alerted.add(mid)
                         side = "лонг" if pos > 0 else "шорт"
-                        actions.append(("alert", mid, f"🛡 {self.sym(mid)}: {side} {fmt(abs(pos))} без стоп-лосса "
+                        actions.append(("alert", mid, f"🛡 {self.sym(mid)}: {side} {num(abs(pos))} без стоп-лосса "
                                                       f"уже {self.cfg.naked_alert_min:g} мин.", "naked"))
                 continue
             self.naked_since.pop(mid, None)
@@ -339,8 +354,8 @@ class Guardian:
                 self.soft_since.pop(mid, None)
                 where = "ниже" if pos > 0 else "выше"
                 actions.append(("emergency", mid,
-                                f"Стоп не сработал: цена в стакане {fmt(px)} {where} триггера {fmt(trig)} "
-                                f"уже {now - since:.0f} с (mark {fmt(q.mark)})", "soft_stop"))
+                                f"Стоп не сработал: цена в стакане {num(px)} {where} триггера {num(trig)} "
+                                f"уже {now - since:.0f} с (mark {num(q.mark)})", "soft_stop"))
         return actions
 
     # ---------- исполнение действий ----------
@@ -359,7 +374,8 @@ class Guardian:
                     await self.emergency_close(mid, payload, mode)
             except Exception as e:  # noqa: BLE001
                 log.exception("Ошибка при выполнении %s", kind)
-                await self.notify(f"❗ {self.sym(mid)}: ошибка при попытке действия ({kind}): {html.escape(str(e))}")
+                await self.notify(f"❗ {self.sym(mid)}: ошибка при попытке действия ({kind}): "
+                                  f"{S(html.escape(redact(str(e))))}")
 
     def _prefix(self, mode: str) -> str:
         if mode == "alert":
@@ -369,17 +385,18 @@ class Guardian:
         return ""
 
     async def do_cleanup(self, mid: int, orphans: list[Order], mode: str) -> None:
-        desc = ", ".join(f"{o.kind} {fmt(o.trigger_price or o.price)}" for o in orphans)
+        desc = ", ".join(f"{o.kind} {num(o.trigger_price or o.price)}" for o in orphans)
         if mode == "act" and not self.cfg.dry_run:
             done, errs = [], []
             for o in orphans:
                 ok, err = await self.ex.cancel_order(mid, o.index)
-                (done if ok else errs).append(f"{o.kind} {fmt(o.trigger_price or o.price)}" + ("" if ok else f" ({err})"))
+                (done if ok else errs).append(f"{o.kind} {num(o.trigger_price or o.price)}" +
+                                              ("" if ok else f" ({S(html.escape(redact(str(err))))})"))
                 if ok:
                     self.orders.pop(o.index, None)
             text = f"🧹 <b>{self.sym(mid)}</b>: позиция закрыта, отменил висящие ордера: {', '.join(done) or '—'}"
             if errs:
-                text += f"\n❗ Не удалось отменить: {html.escape(', '.join(errs))} — проверь вручную"
+                text += f"\n❗ Не удалось отменить: {', '.join(errs)} — проверь вручную"
         else:
             text = (f"{self._prefix(mode)}🧹 <b>{self.sym(mid)}</b>: позиция закрыта, "
                     f"остались ордера: {desc}. {'Отменил бы их.' if mode == 'act' else 'Отмени их вручную.'}")
@@ -390,7 +407,7 @@ class Guardian:
         if pos == 0 or mid in self.closing:
             return
         side = "лонг" if pos > 0 else "шорт"
-        head = f"🚨 <b>{self.sym(mid)}</b>: {html.escape(reason)}.\nПозиция: {side} {fmt(abs(pos))}"
+        head = f"🚨 <b>{self.sym(mid)}</b>: {reason}.\nПозиция: {side} {num(abs(pos))}"
         if mode != "act" or self.cfg.dry_run:
             what = "Закрыл бы её рыночной заявкой." if mode == "act" else "Закрой позицию вручную!"
             await self.notify(f"{self._prefix(mode)}{head}\n{what}")
@@ -425,7 +442,7 @@ class Guardian:
             left = self.positions.get(mid, 0.0)
             if left != 0:
                 await self.notify(f"❗❗ <b>{self.sym(mid)}</b>: НЕ удалось закрыть позицию за "
-                                  f"{self.cfg.emergency_tries} попыток, осталось {fmt(abs(left))}. "
+                                  f"{self.cfg.emergency_tries} попыток, осталось {num(abs(left))}. "
                                   "Закрой вручную!")
         finally:
             self.closing.discard(mid)
@@ -434,7 +451,7 @@ class Guardian:
         cfg = self.cfg
         mode = ("🧪 DRY_RUN (ничего не отправляю)" if cfg.dry_run else "🟢 боевой режим") + \
                (" · ⏸ пауза: только алерты" if self.paused else "")
-        lines = [f"🛡 <b>Guardian · {self.ex.label}</b> — {mode}"]
+        lines = [f"🛡 <b>Guardian · {html.escape(self.ex.label)}</b> — {mode}"]
         open_pos = {m: p for m, p in self.positions.items() if p != 0}
         if not open_pos:
             lines.append("Открытых позиций нет.")
@@ -442,10 +459,10 @@ class Guardian:
             stops = self.stops_for(mid, pos)
             tps = [o for o in self.market_orders(mid) if o.type in TP_TYPES and o.closes(pos)]
             q = self.quotes.get(mid)
-            px = f" · bid {fmt(q.bid)} / ask {fmt(q.ask)} / mark {fmt(q.mark)}" if q else ""
-            sl = ", ".join(fmt(s.trigger_price) for s in stops) or ("tied" if self.tied.get(mid) else "❗ нет")
-            tp = ", ".join(fmt(t.trigger_price) for t in tps) or "—"
-            lines.append(f"<b>{html.escape(self.sym(mid))}</b>: {'лонг' if pos > 0 else 'шорт'} {fmt(abs(pos))}"
+            px = f" · bid {num(q.bid)} / ask {num(q.ask)} / mark {num(q.mark)}" if q else ""
+            sl = ", ".join(num(s.trigger_price) for s in stops) or ("tied" if self.tied.get(mid) else "❗ нет")
+            tp = ", ".join(num(t.trigger_price) for t in tps) or "—"
+            lines.append(f"<b>{self.sym(mid)}</b>: {'лонг' if pos > 0 else 'шорт'} {num(abs(pos))}"
                          f"{px}\n   SL: {sl} · TP: {tp}")
         lines.append(f"\nСценарии: висящие ордера — {cfg.cleanup}, отменённый стоп — {cfg.failed_stop}, "
                      f"стоп не сработал — {cfg.soft_stop} ({cfg.soft_stop_seconds:g} с), "
@@ -456,7 +473,7 @@ class Guardian:
 # ───────────────────────────── биржа Lighter ─────────────────────────────
 
 class LighterExchange:
-    """REST + WebSocket Lighter и подпись транзакций через официальный lighter-sdk."""
+    """REST + WebSocket Lighter. Транзакции подписываются локально (lighter_signer), отправляются нашим кодом."""
 
     def __init__(self, http, network: str, account_index: int | None, api_key_index: int, api_private_key: str,
                  l1_address: str = "", wallet: int = 1, wallet_name: str = "", proxy: str = ""):
@@ -470,53 +487,53 @@ class LighterExchange:
         self.account_index = account_index
         self.l1_address = l1_address
         self.api_key_index = api_key_index
-        self.api_private_key = api_private_key
+        self._api_private_key = api_private_key
         self.markets: dict[int, Market] = {}
         self.signer = None
         self.guardian: Guardian | None = None
         self._coi = int(time.time() * 1000) % (1 << 40)
+        self._tx_lock = asyncio.Lock()      # одна транзакция за раз: nonce идут строго по порядку
 
-    async def get(self, path: str, **params):
+    def _timeout(self, total: float = 20):
         import aiohttp
-        async with self.http.get(f"{self.api_url}/api/v1/{path}", params=params, proxy=self.proxy,
-                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
+        return aiohttp.ClientTimeout(total=total)
+
+    async def get(self, path: str, headers: dict | None = None, **params):
+        async with self.http.get(f"{self.api_url}/api/v1/{path}", params=params, headers=headers,
+                                 proxy=self.proxy, timeout=self._timeout()) as r:
             data = await r.json(content_type=None)
             if r.status >= 400:
                 raise RuntimeError(f"{path}: HTTP {r.status} {data}")
             return data
 
     async def start(self) -> None:
-        import lighter  # официальный SDK: pip install -r requirements.txt
+        from lighter_signer import Signer
         if self.account_index is None:
             data = await self.get("accountsByL1Address", l1_address=self.l1_address)
             subs = data.get("sub_accounts") or []
             if not subs:
-                raise RuntimeError(f"Аккаунт для адреса {self.l1_address} не найден на {self.label}")
+                raise RuntimeError(f"Аккаунт для кошелька не найден на {self.label}")
             self.account_index = int(min(subs, key=lambda s: int(s["index"]))["index"])
         await self.load_markets()
-        self.signer = lighter.SignerClient(url=self.api_url, account_index=self.account_index,
-                                           api_private_keys={self.api_key_index: self.api_private_key},
-                                           chain_id=self.chain_id)
-        if self.proxy:   # отправка ордеров и nonce через SDK — тоже через прокси этого кошелька
-            self.signer.api_client.configuration.proxy = self.proxy
-            self.signer.api_client.rest_client.proxy = self.proxy
+        self.signer = Signer(self.account_index, self.api_key_index, self._api_private_key, self.chain_id)
+        self._api_private_key = None        # дальше ключ живёт только внутри модуля подписи
         await self.verify_key()
         log.info("%s: аккаунт %s, ключ %s — ок, рынков %d%s", self.label, self.account_index,
                  self.api_key_index, len(self.markets),
                  f", прокси {mask_proxy(self.proxy)}" if self.proxy else "")
 
     async def verify_key(self) -> None:
-        """Проверка ключа запросом с подписанным токеном (через наш HTTP-клиент — работает и через прокси)."""
-        import aiohttp
+        """Проверка ключа: закрытый запрос с подписанным токеном. Ошибка — если ключ не тот."""
         token = self.auth_token(600)
         async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
                                  params={"account_index": self.account_index},
                                  headers={"authorization": token}, proxy=self.proxy,
-                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
+                                 timeout=self._timeout()) as r:
             data = await r.json(content_type=None)
         if r.status >= 400 or (isinstance(data, dict) and int(data.get("code", 200)) != 200):
+            msg = data.get("message") if isinstance(data, dict) else data
             raise RuntimeError(f"API-ключ {self.api_key_index} не подходит к аккаунту {self.account_index} "
-                               f"на {self.label}: {data}")
+                               f"на {self.label}: {redact(str(msg))}")
 
     async def load_markets(self) -> None:
         data = await self.get("orderBookDetails", filter="perp")
@@ -525,20 +542,40 @@ class LighterExchange:
                                                        int(m["size_decimals"]), int(m["price_decimals"]))
 
     def auth_token(self, seconds: int = 3600) -> str:
-        token, err = self.signer.create_auth_token_with_expiry(seconds, api_key_index=self.api_key_index)
-        if err:
-            raise RuntimeError(f"auth token: {err}")
+        token = self.signer.auth_token(int(time.time()) + seconds)
+        register_secret(token)
         return token
 
     def _next_coi(self) -> int:
         self._coi = (self._coi + 1) % (1 << 40)
         return self._coi
 
+    async def _nonce(self) -> int:
+        data = await self.get("nextNonce", account_index=self.account_index, api_key_index=self.api_key_index)
+        return int(data["nonce"])
+
+    async def _send(self, build) -> tuple[bool, str]:
+        """build(nonce) → (tx_type, tx_info). Подпись локально, отправка POST /api/v1/sendTx.
+        Если биржа отвергла nonce — один повтор со свежим nonce."""
+        async with self._tx_lock:
+            for attempt in range(2):
+                tx_type, tx_info = build(await self._nonce())
+                async with self.http.post(f"{self.api_url}/api/v1/sendTx",
+                                          data={"tx_type": str(tx_type), "tx_info": tx_info},
+                                          headers={"Accept": "application/json"},
+                                          proxy=self.proxy, timeout=self._timeout()) as r:
+                    data = await r.json(content_type=None)
+                code = int(data.get("code", r.status)) if isinstance(data, dict) else r.status
+                if r.status < 400 and code == 200:
+                    return True, ""
+                msg = str(data.get("message") if isinstance(data, dict) else data)
+                if attempt == 0 and "nonce" in msg.lower():
+                    continue
+                return False, redact(msg or f"HTTP {r.status}")
+        return False, "nonce"
+
     async def cancel_order(self, mid: int, order_index: int) -> tuple[bool, str]:
-        _, resp, err = await self.signer.cancel_order(market_index=mid, order_index=order_index)
-        if err or resp is None or getattr(resp, "code", 200) != 200:
-            return False, str(err or getattr(resp, "message", "") or "ошибка")
-        return True, ""
+        return await self._send(lambda n: self.signer.cancel_order(mid, order_index, n))
 
     async def best_price(self, mid: int, is_ask: bool) -> float:
         data = await self.get("orderBookOrders", market_id=mid, limit=1)
@@ -550,14 +587,9 @@ class LighterExchange:
         base = int(round(size * 10 ** m.size_decimals))
         # округляем цену в «безопасную» сторону, чтобы не сузить допуск
         scale = 10 ** m.price_decimals
-        price = math.floor(worst_price * scale) if is_ask else math.ceil(worst_price * scale)
-        price = max(price, 1)
-        _, resp, err = await self.signer.create_market_order(
-            market_index=mid, client_order_index=self._next_coi(), base_amount=base,
-            avg_execution_price=price, is_ask=is_ask, reduce_only=True)
-        if err or resp is None or getattr(resp, "code", 200) != 200:
-            return False, str(err or getattr(resp, "message", "") or "ошибка")
-        return True, ""
+        price = max(math.floor(worst_price * scale) if is_ask else math.ceil(worst_price * scale), 1)
+        coi = self._next_coi()
+        return await self._send(lambda n: self.signer.market_order(mid, coi, base, price, is_ask, True, n))
 
     async def refresh_positions(self) -> None:
         data = await self.get("account", by="index", value=str(self.account_index))
@@ -570,7 +602,6 @@ class LighterExchange:
     async def stream(self) -> None:
         """WebSocket: ордера, позиции, цены. Переподключение раз в 50 минут — чтобы обновить токен."""
         import aiohttp
-        g = self.guardian
         backoff = 1
         while True:
             try:
@@ -631,7 +662,7 @@ class LighterExchange:
                 except (KeyError, TypeError, ValueError):
                     pass
         elif "error" in msg:
-            log.warning("%s: WebSocket: %s", self.label, msg)
+            log.warning("%s: WebSocket: %s", self.label, redact(str(msg.get("error"))))
 
 
 def parse_positions(raw) -> tuple[dict[int, float], dict[int, int]]:
@@ -652,25 +683,32 @@ def parse_positions(raw) -> tuple[dict[int, float], dict[int, int]]:
 # ───────────────────────────── Telegram ─────────────────────────────
 
 class Telegram:
-    def __init__(self, http, token: str, chat_id: str):
+    """Уведомления и команды. Отвечает только владельцу (TG_CHAT_ID).
+    TG_DETAIL: full — всё; short (по умолчанию) — без размеров, цен и номеров аккаунтов; minimal — ещё и без тикеров."""
+
+    def __init__(self, http, token: str, chat_id: str, proxy: str = "", detail: str = "short"):
         self.http, self.token, self.chat_id = http, token, chat_id
+        self.proxy = proxy or None
+        self.detail = detail if detail in ("full", "short", "minimal") else "short"
         self.offset = 0
 
     async def call(self, method: str, **params):
         if not self.token:
             return None
         import aiohttp
-        async with self.http.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
+        async with self.http.post(f"https://{TELEGRAM_HOST}/bot{self.token}/{method}", json=params,
+                                  proxy=self.proxy,
                                   timeout=aiohttp.ClientTimeout(total=params.get("timeout", 0) + 15)) as r:
             return await r.json(content_type=None)
 
     async def send(self, text: str) -> None:
-        log.info("TG: %s", re.sub(r"<[^>]+>", "", text))
+        # в локальный лог — полностью (он остаётся на твоём компьютере), секреты всё равно вымараны
+        log.info("TG: %s", redact(re.sub(r"<[^>]+>", "", strip_marks(text))))
         if not (self.token and self.chat_id):
             return
         try:
-            await self.call("sendMessage", chat_id=self.chat_id, text=text[:4000], parse_mode="HTML",
-                            disable_web_page_preview=True)
+            await self.call("sendMessage", chat_id=self.chat_id, text=redact(render(text, self.detail))[:4000],
+                            parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:  # noqa: BLE001
             log.warning("Telegram: %s", e)
 
@@ -691,20 +729,20 @@ class Telegram:
                     self.offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     if str((msg.get("chat") or {}).get("id")) != str(self.chat_id):
-                        continue      # отвечаем только владельцу
+                        continue      # чужим не отвечаем вообще
                     parts = (msg.get("text") or "").strip().split()
                     if not parts:
                         continue
                     cmd = parts[0].split("@")[0].lower()
                     # необязательный номер кошелька: /status 2, /pause 1
-                    num = next((int(x.lstrip("#")) for x in parts[1:] if x.lstrip("#").isdigit()), None)
-                    sel = [g for g in guardians if num is None or g.ex.wallet == num]
-                    if num is not None and not sel:
-                        await self.send(f"Кошелька #{num} нет. Есть: " +
+                    num_ = next((int(x.lstrip("#")) for x in parts[1:] if x.lstrip("#").isdigit()), None)
+                    sel = [g for g in guardians if num_ is None or g.ex.wallet == num_]
+                    if num_ is not None and not sel:
+                        await self.send(f"Кошелька #{num_} нет. Есть: " +
                                         ", ".join(sorted({f"#{g.ex.wallet}" for g in guardians})))
                         continue
-                    hs = [h for h in hedges if num is None or h.wallet == num]
-                    who = "всех кошельков" if num is None else f"кошелька #{num}"
+                    hs = [h for h in hedges if num_ is None or h.wallet == num_]
+                    who = "всех кошельков" if num_ is None else f"кошелька #{num_}"
                     if cmd in ("/status", "/start"):
                         out = [g.status_text() for g in sel] + [h.pairs_text() for h in hs if h.pairs]
                         await self.send("\n\n".join(out))
@@ -714,9 +752,10 @@ class Telegram:
                     elif cmd == "/wallets":
                         rows = {}
                         for g in guardians:
+                            prox = getattr(g.ex, "proxy", None)
                             rows.setdefault(g.ex.wallet, []).append(
-                                f"{g.ex.venue} (аккаунт {g.ex.account_index}"
-                                f"{', прокси ' + mask_proxy(g.ex.proxy) if g.ex.proxy else ''}){' ⏸' if g.paused else ''}")
+                                f"{g.ex.venue} (аккаунт {S(g.ex.account_index)}"
+                                f"{', прокси ' + S(mask_proxy(prox)) if prox else ''}){' ⏸' if g.paused else ''}")
                         names = {g.ex.wallet: g.ex.wallet_name for g in guardians}
                         await self.send("👛 <b>Кошельки</b>\n" + "\n".join(
                             f"#{n}{' ' + html.escape(names[n]) if names[n] else ''}: {', '.join(v)}"
@@ -725,7 +764,7 @@ class Telegram:
                         for g in sel:
                             g.paused = True
                         await self.send(f"⏸ Пауза для {who}: только алерты, никаких действий на бирже. "
-                                        f"/resume{'' if num is None else ' ' + str(num)} — вернуть.")
+                                        f"/resume{'' if num_ is None else ' ' + str(num_)} — вернуть.")
                     elif cmd == "/resume":
                         for g in sel:
                             g.paused = False
@@ -743,6 +782,7 @@ def wallet_configs() -> list[dict]:
     """Кошельки W1_…, W2_…, … — на каждом можно подключить RH и/или CORE.
     Старый формат RH_* / CORE_* без номера считается кошельком №1."""
     wallets: dict[int, dict] = {}
+    common_proxy = env("PROXY")
 
     def add(n: int, prefix: str, venue: str, default_net: str, shared_l1: str, name: str, proxy: str):
         key = env(f"{prefix}API_PRIVATE_KEY")
@@ -764,30 +804,59 @@ def wallet_configs() -> list[dict]:
     # старый формат без номера → кошелёк №1
     if env("RH_API_PRIVATE_KEY") or env("CORE_API_PRIVATE_KEY"):
         l1 = env("ADDRESS")
-        add(1, "RH_", "RH", "robinhood", l1, env("NAME"), PROXY)
-        add(1, "CORE_", "CORE", "mainnet", l1, env("NAME"), PROXY)
-    numbers = sorted({int(m.group(1)) for k in os.environ if (m := re.match(r"W(\d+)_", k))})
+        add(1, "RH_", "RH", "robinhood", l1, env("NAME"), common_proxy)
+        add(1, "CORE_", "CORE", "mainnet", l1, env("NAME"), common_proxy)
+    numbers = sorted({int(m.group(1)) for k in env_names() if (m := re.match(r"W(\d+)_", k))})
     for n in numbers:
         if n in wallets:
             raise SystemExit(f"Кошелёк #{n} задан дважды: и через RH_/CORE_, и через W{n}_")
         l1, name = env(f"W{n}_ADDRESS"), env(f"W{n}_NAME")
-        proxy = env(f"W{n}_PROXY") or PROXY          # свой прокси кошелька, иначе общий
+        proxy = env(f"W{n}_PROXY") or common_proxy          # свой прокси кошелька, иначе общий
         add(n, f"W{n}_RH_", "RH", "robinhood", l1, name, proxy)
         add(n, f"W{n}_CORE_", "CORE", "mainnet", l1, name, proxy)
     if not wallets:
-        raise SystemExit("Не задан ни один кошелёк: W1_ADDRESS + W1_RH_API_PRIVATE_KEY и/или "
-                         "W1_CORE_API_PRIVATE_KEY (см. .env.example)")
+        raise SystemExit("Не задан ни один кошелёк. Создай ключи: python setup_key.py --wallet 1")
     return [wallets[n] for n in sorted(wallets)]
+
+
+def load_secrets() -> None:
+    """Секреты — из зашифрованного хранилища. Открытым текстом — только если явно разрешено."""
+    import vault
+    plain = sorted(k for k in os.environ if vault.is_secret(k) and os.environ[k].strip())
+    allow_plain = env_bool("ALLOW_PLAINTEXT_SECRETS", False)
+    if plain and not allow_plain:
+        raise SystemExit("❌ В .env или окружении лежат секреты открытым текстом: " + ", ".join(plain) +
+                         "\nПеренеси их в зашифрованное хранилище: python vault.py import .env")
+    if vault.DEFAULT_PATH.exists():
+        try:
+            v = vault.unlock()
+        except vault.VaultError as e:
+            raise SystemExit(f"❌ {e}") from None
+        SECRETS.update(v.data)
+        log.info("Хранилище открыто: %d записей", len(v.data))
+    elif not allow_plain:
+        raise SystemExit("❌ Нет хранилища секретов. Создай: python vault.py init, "
+                         "затем python setup_key.py --wallet 1")
+    for k in env_names():
+        if vault.is_secret(k):
+            register_secret(env(k))
 
 
 async def main_async() -> None:
     import aiohttp
+    from security import SafeSession, harden_process
+    for item in harden_process():
+        log.info("Защита: %s", item)
+    load_secrets()
     cfg = Config()
     max_runtime = env_float("MAX_RUNTIME_MIN", 0) * 60
-    if PROXY:
-        log.info("Общий прокси: %s", mask_proxy(PROXY))
-    async with aiohttp.ClientSession(trust_env=True) as http:
-        tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"))
+    common_proxy = env("PROXY")
+    log.info("Разрешённые адреса: %s", ", ".join(sorted(ALLOWED_HOSTS)))
+    # trust_env=False: системные переменные прокси игнорируются — только явно заданные PROXY / W{n}_PROXY
+    async with aiohttp.ClientSession(trust_env=False) as raw:
+        http = SafeSession(raw, ALLOWED_HOSTS)
+        tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"), proxy=common_proxy,
+                      detail=env("TG_DETAIL", "short").lower())
         guardians, tasks, hedges = [], [], []
         for w in wallet_configs():
             wg = []
@@ -796,7 +865,8 @@ async def main_async() -> None:
                 try:
                     await ex.start()
                 except Exception as e:  # noqa: BLE001
-                    await tg.send(f"❗ <b>{html.escape(ex.label)}</b>: не удалось подключиться — {html.escape(str(e))}")
+                    await tg.send(f"❗ <b>{html.escape(ex.label)}</b>: не удалось подключиться — "
+                                  f"{S(html.escape(redact(str(e))))}")
                     raise
                 g = Guardian(ex, cfg, tg.send)
                 ex.guardian = g
@@ -807,6 +877,7 @@ async def main_async() -> None:
             if len(wg) >= 2 and cfg.hedge != "off":
                 from hedge import HedgeManager
                 hedges.append(HedgeManager({g.ex.label: g for g in wg}, cfg, tg.send, wallet=w["wallet"]))
+        SECRETS.clear()             # ключи уже внутри модуля подписи — копии в памяти Python не нужны
 
         async def hedge_ticker():
             while True:
@@ -845,7 +916,10 @@ async def main_async() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=env("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    from security import install_log_redaction
+    logging.basicConfig(level=env("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s",
+                        stream=sys.stdout)
+    install_log_redaction()
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:

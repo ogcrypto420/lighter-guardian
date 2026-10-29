@@ -43,7 +43,7 @@ def make(cfg=None):
     sent = []
 
     async def notify(t):
-        sent.append(t)
+        sent.append(G.strip_marks(t))
     c = cfg or G.Config()
     c.dry_run = False
     c.cleanup = c.failed_stop = c.soft_stop = "act"
@@ -138,7 +138,7 @@ def test_soft_stop():
     assert g.tick(now=103) == []
     g.on_quote(15, 209.4, 209.6, 210.8, now=105.1)
     acts = g.tick(now=105.1)
-    assert acts and acts[0][0] == "emergency" and "mark 210.8" in acts[0][2], acts
+    assert acts and acts[0][0] == "emergency" and "mark 210.8" in G.strip_marks(acts[0][2]), acts
     run(g.run_actions(acts))
     assert ex.closes[0][:3] == (15, 2.0, True) and ex.closes[0][3] == round(209.4 * 0.99, 4)
     print("3. цена за стопом 5 с, стоп не исполнился → закрыто ✓")

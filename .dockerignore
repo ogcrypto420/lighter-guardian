@@ -1,0 +1,8 @@
+.git
+.env
+*.vault
+data/
+password*.txt
+signers/
+__pycache__/
+tests/

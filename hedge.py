@@ -16,6 +16,8 @@ import math
 import time
 from dataclasses import dataclass, field
 
+from security import S, T
+
 log = logging.getLogger("guardian.hedge")
 
 # одна и та же акция под разными тикерами на RH и CORE
@@ -64,7 +66,7 @@ class HedgeManager:
     def name(self, leg: Leg) -> str:
         g = self.g.get(leg[0])
         m = g.ex.markets.get(leg[1]) if g else None
-        return f"{m.symbol if m else leg[1]}·{leg[0]}"
+        return f"{T(m.symbol if m else leg[1])}·{leg[0]}"
 
     def in_pair(self, leg: Leg) -> Pair | None:
         return next((p for p in self.pairs if leg in p.legs()), None)
@@ -78,7 +80,8 @@ class HedgeManager:
             return f"🔗 Кошелёк #{self.wallet}: вилок нет. Один тикер в разные стороны на RH и CORE свяжется сам."
         lines = [f"🔗 <b>Вилки кошелька #{self.wallet}</b>"]
         for p in self.pairs:
-            lines.append(f"<b>{self.name(p.a)}</b> {self.pos(p.a):+g} ↔ <b>{self.name(p.b)}</b> {self.pos(p.b):+g}")
+            lines.append(f"<b>{self.name(p.a)}</b> {S(f'{self.pos(p.a):+g}')} ↔ "
+                         f"<b>{self.name(p.b)}</b> {S(f'{self.pos(p.b):+g}')}")
         return "\n".join(lines)
 
     # ---------- основная проверка ----------
@@ -148,8 +151,8 @@ class HedgeManager:
                     p = Pair(la, lb, sign={la: 1.0 if pa > 0 else -1.0, lb: 1.0 if pb > 0 else -1.0},
                              sync={la: abs(pa), lb: abs(pb)}, seen={la: pa, lb: pb})
                     self.pairs.append(p)
-                    actions.append(("note", f"🔗 Вижу вилку: <b>{self.name(la)}</b> {pa:+g} ↔ "
-                                            f"<b>{self.name(lb)}</b> {pb:+g}. Если одна нога закроется "
+                    actions.append(("note", f"🔗 Вижу вилку: <b>{self.name(la)}</b> {S(f'{pa:+g}')} ↔ "
+                                            f"<b>{self.name(lb)}</b> {S(f'{pb:+g}')}. Если одна нога закроется "
                                             "или уменьшится — подрежу вторую."))
                     break
 
@@ -170,7 +173,8 @@ class HedgeManager:
                     await self.reduce(*act[1:])
             except Exception as e:  # noqa: BLE001
                 log.exception("hedge action")
-                await self.notify(f"❗ Вилка: ошибка — {html.escape(str(e))}")
+                from security import redact
+                await self.notify(f"❗ Вилка: ошибка — {S(html.escape(redact(str(e))))}")
 
     async def reduce(self, p: Pair, leg: Leg, other: Leg, delta: float, target: float, why: str) -> None:
         g = self.g[other[0]]
@@ -181,9 +185,9 @@ class HedgeManager:
         full = target == 0
         size = abs(ocur) if full else round(math.floor(delta / step + 1e-9) * step, m.size_decimals)
         after = 0.0 if full else (abs(ocur) - size) * (1 if ocur > 0 else -1)
-        head = (f"⚖️ <b>{self.name(leg)}</b> {why} (теперь {self.pos(leg):+g}).\n"
+        head = (f"⚖️ <b>{self.name(leg)}</b> {why} (теперь {S(f'{self.pos(leg):+g}')}).\n"
                 f"{'Закрываю' if full else 'Подрезаю'} вторую ногу <b>{self.name(other)}</b>: "
-                f"{ocur:+g} → {after:+g}")
+                f"{S(f'{ocur:+g} → {after:+g}')}")
         if size <= 0:
             p.expected.pop(other, None)
             p.sync[other] = abs(ocur)
@@ -222,9 +226,10 @@ class HedgeManager:
             if abs(self.pos(other)) > target + step / 2:
                 await ex.refresh_positions()
             if abs(self.pos(other)) <= target + step / 2:
-                await self.notify(f"✅ <b>{self.name(other)}</b>: теперь {self.pos(other):+g} "
+                await self.notify(f"✅ <b>{self.name(other)}</b>: теперь {S(f'{self.pos(other):+g}')} "
                                   f"(попытка {attempt}, допуск {slip * 100:g}%)")
                 return
         if abs(self.pos(other)) > target + step / 2:
             await self.notify(f"❗❗ <b>{self.name(other)}</b>: не удалось {'закрыть' if full else 'подрезать'} "
-                              f"за {tries} попыток, сейчас {self.pos(other):+g}, нужно {target:g}. Сделай вручную!")
+                              f"за {tries} попыток, сейчас {S(f'{self.pos(other):+g}')}, нужно {S(f'{target:g}')}. "
+                              "Сделай вручную!")

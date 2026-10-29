@@ -1,3 +1,4 @@
-aiohttp>=3.9
-# официальный SDK Lighter (подпись транзакций), зафиксирован на проверенной версии
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@5825eb19867a4dbdd47c02642dc1eec30c30ca73
+# Зависимости стража. Только две известные библиотеки — меньше стороннего кода рядом с ключами.
+# Официальный модуль подписи Lighter скачивается отдельно: python fetch_signer.py (проверка SHA-256).
+aiohttp>=3.11,<4
+cryptography>=44,<51

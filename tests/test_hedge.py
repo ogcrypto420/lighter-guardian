@@ -39,7 +39,7 @@ def setup(dry=False, mode="act"):
     msgs = []
 
     async def notify(t):
-        msgs.append(t)
+        msgs.append(G.strip_marks(t))
     cfg = G.Config()
     cfg.dry_run, cfg.hedge, cfg.hedge_debounce = dry, mode, 0.7
     rh = Ex("RH", {15: G.Market(15, "NVDA", 4, 2), 37: G.Market(37, "SKHY", 4, 2)})

@@ -37,7 +37,7 @@ def build():
     msgs = []
 
     async def notify(t):
-        msgs.append(t)
+        msgs.append(G.strip_marks(t))
     cfg = G.Config()
     cfg.dry_run, cfg.hedge, cfg.hedge_debounce = False, "act", 0.7
     gs, hedges = [], []
@@ -65,7 +65,8 @@ def test_hedge_stays_inside_wallet():
     core1.on_positions({115: -5.0}, now=3)   # а вот это вилка кошелька 1
     acts = [a for h in hedges for a in h.tick(now=4)]
     assert len(hedges[0].pairs) == 1 and not hedges[1].pairs
-    assert "NVDA·#1 RH" in acts[0][1] and "NVDA·#1 CORE" in acts[0][1]
+    note = G.strip_marks(acts[0][1])
+    assert "NVDA·#1 RH" in note and "NVDA·#1 CORE" in note
     print("1. вилка ищется только внутри своего кошелька ✓")
 
 
@@ -75,7 +76,7 @@ def test_telegram_commands():
     sent = []
 
     async def fake_send(t):
-        sent.append(t)
+        sent.append(G.strip_marks(t))
     tg.send = fake_send
     texts = iter(["/pause 2", "/status 1", "/wallets", "/resume", "/status 9", "/pairs 1"])
 
@@ -113,20 +114,20 @@ def test_pause_one_wallet_only():
 
 def test_wallet_proxies():
     for k in list(os.environ):
-        if k.startswith(("W1_", "W2_", "W3_", "RH_", "CORE_")):
+        if k.startswith(("W1_", "W2_", "W3_", "RH_", "CORE_")) or k == "PROXY":
             del os.environ[k]
-    os.environ.update({
+    G.SECRETS.clear()
+    G.SECRETS.update({                       # так данные приходят из зашифрованного хранилища
+        "PROXY": "http://g:g@10.0.0.9:8009",
         "W1_ADDRESS": "0xA", "W1_PROXY": "http://u1:p1@10.0.0.1:8001",
         "W1_RH_API_PRIVATE_KEY": "k", "W1_CORE_API_PRIVATE_KEY": "k",
         "W2_ADDRESS": "0xB", "W2_RH_API_PRIVATE_KEY": "k",
         "W3_ADDRESS": "0xC", "W3_PROXY": "http://10.0.0.3:8003", "W3_CORE_PROXY": "http://u:p@10.0.0.33:8033",
         "W3_RH_API_PRIVATE_KEY": "k", "W3_CORE_API_PRIVATE_KEY": "k"})
-    old = G.PROXY
-    G.PROXY = "http://g:g@10.0.0.9:8009"
     try:
         ws = {w["wallet"]: [e["proxy"] for e in w["exchanges"]] for w in G.wallet_configs()}
     finally:
-        G.PROXY = old
+        G.SECRETS.clear()
     assert ws[1] == ["http://u1:p1@10.0.0.1:8001"] * 2           # свой прокси на обе биржи
     assert ws[2] == ["http://g:g@10.0.0.9:8009"]                  # своего нет — общий
     assert ws[3] == ["http://10.0.0.3:8003", "http://u:p@10.0.0.33:8033"]  # можно и отдельно на биржу
@@ -142,7 +143,7 @@ def test_wallet_proxies():
         async def json(self, **k): return {"code": 200, "order_book_details": []}
 
     class Http:
-        def get(self, url, **kw):
+        def get(self, url, **kw):  # noqa: D401
             seen.append((url, kw.get("proxy")))
             return Resp()
     ex = G.LighterExchange(Http(), "robinhood", 5, 4, "k", wallet=1, proxy="http://u1:p1@10.0.0.1:8001")

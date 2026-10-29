@@ -1,3 +1,8 @@
 .env
+guardian.vault
+*.vault
+password*.txt
+signers/
 __pycache__/
 *.pyc
+data/

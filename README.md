@@ -52,7 +52,8 @@
 Нужен Python 3.10+.
 
 ```bash
-cd lighter_guardian                       # папка проекта (git clone или архив)
+git clone https://github.com/ogcrypto420/lighter-guardian.git
+cd lighter-guardian
 pip install -r requirements-setup.txt     # aiohttp, cryptography и eth-account (для создания ключей)
 python fetch_signer.py                    # официальный модуль подписи Lighter, с проверкой SHA-256
 cp .env.example .env                      # настройки поведения; ключей там нет
@@ -150,7 +151,7 @@ python guardian.py
 # на сервере, в папке проекта (если ты не root — добавляй sudo)
 cp .env.example .env && nano .env                     # настройки поведения
 mkdir -p data
-# со своего компьютера: scp guardian.vault root@IP-сервера:lighter_guardian/data/
+# со своего компьютера: scp guardian.vault root@IP-сервера:lighter-guardian/data/
 install -m 600 /dev/null data/password.txt && nano data/password.txt   # пароль хранилища, одной строкой
 chown -R 10001:10001 data && chmod -R go= data        # читать папку сможет только страж
 docker build -t lighter-guardian .

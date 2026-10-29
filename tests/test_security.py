@@ -273,6 +273,28 @@ def test_missing_password_file():
     print("11. нет файла с паролем и нет терминала — понятная ошибка, без падения ✓")
 
 
+def test_wallet_from_site():
+    k = "ab" * 40
+    e = V.wallet_entries(2, "Мобильный", "0x" + "12" * 20,
+                         {"RH": {"key": k, "index": "5", "account": ""}, "CORE": {"key": "0x" + k, "index": "4",
+                                                                                  "account": "77"}})
+    assert e["W2_RH_API_PRIVATE_KEY"] == "0x" + k and e["W2_RH_API_KEY_INDEX"] == "5"
+    assert "W2_RH_ACCOUNT_INDEX" not in e and e["W2_CORE_ACCOUNT_INDEX"] == "77" and e["W2_NAME"] == "Мобильный"
+    for bad in ({"RH": {"key": k, "index": "2"}}, {"RH": {"key": "xyz", "index": "4"}}, {}):
+        try:
+            V.wallet_entries(2, "", "0x" + "12" * 20, bad)
+            raise AssertionError(bad)
+        except V.VaultError:
+            pass
+    # страж видит такой кошелёк
+    import guardian as G
+    G.SECRETS.clear(); G.SECRETS.update(e)
+    w = G.wallet_configs()
+    G.SECRETS.clear()
+    assert [(x["wallet"], [c["network"] for c in x["exchanges"]]) for x in w] == [(2, ["robinhood", "mainnet"])]
+    print("12. ключи с сайта Lighter: проверка формата и индекса, страж видит кошелёк ✓")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

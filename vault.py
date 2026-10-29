@@ -6,6 +6,7 @@
 Файл хранилища без пароля бесполезен; пароль нигде не сохраняется.
 
     python vault.py init              создать хранилище
+    python vault.py wallet            добавить кошелёк с ключами, созданными на сайте Lighter
     python vault.py set TG_TOKEN      записать значение (ввод скрыт)
     python vault.py set TG_CHAT_ID 123456789
     python vault.py list              что лежит в хранилище (значения скрыты)
@@ -218,6 +219,58 @@ def import_env(v: Vault, env_path: Path) -> list[str]:
     return moved
 
 
+# ───────────────────────────── кошелёк с ключами с сайта ─────────────────────────────
+
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+API_KEY_RE = re.compile(r"^(0x)?[0-9a-fA-F]{80}$")
+
+
+def wallet_entries(n: int, name: str, address: str, venues: dict[str, dict]) -> dict[str, str]:
+    """Записи хранилища для кошелька №n. venues: {"RH"|"CORE": {key, index, account}}."""
+    if n < 1:
+        raise VaultError("Номер кошелька — 1, 2, 3…")
+    if not ADDRESS_RE.match(address):
+        raise VaultError("Адрес кошелька должен быть вида 0x и 40 символов")
+    if not venues:
+        raise VaultError("Нужен ключ хотя бы для одной биржи")
+    out = {f"W{n}_ADDRESS": address}
+    if name:
+        out[f"W{n}_NAME"] = name
+    for venue, d in venues.items():
+        key = d["key"].strip()
+        if not API_KEY_RE.match(key):
+            raise VaultError(f"{venue}: это не похоже на API-ключ Lighter (80 шестнадцатеричных символов)")
+        idx = int(d.get("index") or 4)
+        if idx in (0, 1, 2, 3, 255) or not 0 <= idx <= 254:
+            raise VaultError(f"{venue}: индекс {idx} занят самим Lighter, нужен 4–254")
+        p = f"W{n}_{venue}_"
+        out[f"{p}API_PRIVATE_KEY"] = key if key.startswith("0x") else "0x" + key
+        out[f"{p}API_KEY_INDEX"] = str(idx)
+        if d.get("account"):
+            out[f"{p}ACCOUNT_INDEX"] = str(int(d["account"]))
+    return out
+
+
+def add_wallet_interactive(v: Vault) -> int:
+    def ask(q: str, default: str = "") -> str:
+        a = input(f"{q}{f' [{default}]' if default else ''}: ").strip()
+        return a or default
+    n = int(ask("Номер кошелька", "1"))
+    name = ask("Подпись в сообщениях (например, Основной)")
+    address = ask("Адрес кошелька 0x…")
+    venues = {}
+    for venue, title in (("RH", "Lighter RH"), ("CORE", "Lighter Core")):
+        key = getpass.getpass(f"API-ключ (Private Key) с {title}, Enter — пропустить (ввод скрыт): ").strip()
+        if not key:
+            continue
+        idx = ask(f"  индекс этого ключа на {title}", "4")
+        acc = ask("  номер аккаунта (Enter — страж найдёт основной сам)")
+        venues[venue] = {"key": key, "index": idx, "account": acc}
+    v.data.update(wallet_entries(n, name, address, venues))
+    v.save()
+    return n
+
+
 # ───────────────────────────── командная строка ─────────────────────────────
 
 def main(argv: list[str]) -> None:
@@ -255,6 +308,13 @@ def main(argv: list[str]) -> None:
             v = unlock()
             moved = import_env(v, env_path)
             print(f"✅ Перенесено в хранилище: {', '.join(moved) or 'ничего'}. Из {env_path} эти строки стёрты.")
+        elif cmd == "wallet":
+            v = unlock()
+            try:
+                n = add_wallet_interactive(v)
+            except ValueError:
+                sys.exit("❌ Номер, индекс и аккаунт — числа")
+            print(f"✅ Кошелёк #{n} записан в хранилище. Ключи на экран не выводились.")
         elif cmd == "passwd":
             v = unlock()
             v.change_password(new_password())

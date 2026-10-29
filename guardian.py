@@ -454,10 +454,13 @@ class LighterExchange:
     """REST + WebSocket Lighter и подпись транзакций через официальный lighter-sdk."""
 
     def __init__(self, http, network: str, account_index: int | None, api_key_index: int, api_private_key: str,
-                 l1_address: str = ""):
+                 l1_address: str = "", wallet: int = 1, wallet_name: str = ""):
         self.http = http
         self.network = network
-        self.api_url, self.ws_url, self.chain_id, self.label = NETWORKS[network]
+        self.api_url, self.ws_url, self.chain_id, self.venue = NETWORKS[network]
+        self.wallet = wallet
+        self.wallet_name = wallet_name
+        self.label = f"#{wallet}{' ' + wallet_name if wallet_name else ''} {self.venue}"
         self.account_index = account_index
         self.l1_address = l1_address
         self.api_key_index = api_key_index
@@ -661,12 +664,13 @@ class Telegram:
         except Exception as e:  # noqa: BLE001
             log.warning("Telegram: %s", e)
 
-    async def poll(self, guardians: list[Guardian], hedge=None) -> None:
+    async def poll(self, guardians: list[Guardian], hedges=()) -> None:
         if not (self.token and self.chat_id):
             return
         await self.call("setMyCommands", commands=[
             {"command": "status", "description": "Позиции и стопы"},
             {"command": "pairs", "description": "Вилки RH ↔ CORE"},
+            {"command": "wallets", "description": "Кошельки и аккаунты"},
             {"command": "pause", "description": "Только алерты, без действий"},
             {"command": "resume", "description": "Снова действовать"},
         ])
@@ -678,23 +682,43 @@ class Telegram:
                     msg = upd.get("message") or {}
                     if str((msg.get("chat") or {}).get("id")) != str(self.chat_id):
                         continue      # отвечаем только владельцу
-                    cmd = (msg.get("text") or "").split("@")[0].strip().lower()
-                    if cmd == "/status" or cmd == "/start":
-                        parts = [g.status_text() for g in guardians]
-                        if hedge:
-                            parts.append(hedge.pairs_text())
-                        await self.send("\n\n".join(parts))
+                    parts = (msg.get("text") or "").strip().split()
+                    if not parts:
+                        continue
+                    cmd = parts[0].split("@")[0].lower()
+                    # необязательный номер кошелька: /status 2, /pause 1
+                    num = next((int(x.lstrip("#")) for x in parts[1:] if x.lstrip("#").isdigit()), None)
+                    sel = [g for g in guardians if num is None or g.ex.wallet == num]
+                    if num is not None and not sel:
+                        await self.send(f"Кошелька #{num} нет. Есть: " +
+                                        ", ".join(sorted({f"#{g.ex.wallet}" for g in guardians})))
+                        continue
+                    hs = [h for h in hedges if num is None or h.wallet == num]
+                    who = "всех кошельков" if num is None else f"кошелька #{num}"
+                    if cmd in ("/status", "/start"):
+                        out = [g.status_text() for g in sel] + [h.pairs_text() for h in hs if h.pairs]
+                        await self.send("\n\n".join(out))
                     elif cmd == "/pairs":
-                        await self.send(hedge.pairs_text() if hedge else
-                                        "Вилки работают, когда подключены обе биржи: RH и CORE.")
+                        await self.send("\n\n".join(h.pairs_text() for h in hs) if hs else
+                                        "Вилки работают, когда у кошелька подключены обе биржи: RH и CORE.")
+                    elif cmd == "/wallets":
+                        rows = {}
+                        for g in guardians:
+                            rows.setdefault(g.ex.wallet, []).append(
+                                f"{g.ex.venue} (аккаунт {g.ex.account_index}){' ⏸' if g.paused else ''}")
+                        names = {g.ex.wallet: g.ex.wallet_name for g in guardians}
+                        await self.send("👛 <b>Кошельки</b>\n" + "\n".join(
+                            f"#{n}{' ' + html.escape(names[n]) if names[n] else ''}: {', '.join(v)}"
+                            for n, v in sorted(rows.items())))
                     elif cmd == "/pause":
-                        for g in guardians:
+                        for g in sel:
                             g.paused = True
-                        await self.send("⏸ Пауза: только алерты, никаких действий на бирже. /resume — вернуть.")
+                        await self.send(f"⏸ Пауза для {who}: только алерты, никаких действий на бирже. "
+                                        f"/resume{'' if num is None else ' ' + str(num)} — вернуть.")
                     elif cmd == "/resume":
-                        for g in guardians:
+                        for g in sel:
                             g.paused = False
-                        await self.send("▶️ Страж снова действует.")
+                        await self.send(f"▶️ Страж снова действует для {who}.")
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -704,25 +728,43 @@ class Telegram:
 
 # ───────────────────────────── запуск ─────────────────────────────
 
-def exchange_configs() -> list[dict]:
-    """Блоки настроек RH_* и CORE_* — можно включить один или оба."""
-    out = []
-    for prefix, default_net in (("RH", "robinhood"), ("CORE", "mainnet")):
-        key = env(f"{prefix}_API_PRIVATE_KEY")
+def wallet_configs() -> list[dict]:
+    """Кошельки W1_…, W2_…, … — на каждом можно подключить RH и/или CORE.
+    Старый формат RH_* / CORE_* без номера считается кошельком №1."""
+    wallets: dict[int, dict] = {}
+
+    def add(n: int, prefix: str, venue: str, default_net: str, shared_l1: str, name: str):
+        key = env(f"{prefix}API_PRIVATE_KEY")
         if not key:
-            continue
-        net = env(f"{prefix}_NETWORK", default_net)
+            return
+        net = env(f"{prefix}NETWORK", default_net)
         if net not in NETWORKS:
-            raise SystemExit(f"{prefix}_NETWORK: неизвестная сеть {net}. Варианты: {', '.join(NETWORKS)}")
-        acc = env(f"{prefix}_ACCOUNT_INDEX")
-        l1 = env(f"{prefix}_L1_ADDRESS")
+            raise SystemExit(f"{prefix}NETWORK: неизвестная сеть {net}. Варианты: {', '.join(NETWORKS)}")
+        acc = env(f"{prefix}ACCOUNT_INDEX")
+        l1 = env(f"{prefix}L1_ADDRESS") or shared_l1
         if not acc and not l1:
-            raise SystemExit(f"Укажи {prefix}_ACCOUNT_INDEX или {prefix}_L1_ADDRESS")
-        out.append(dict(network=net, account_index=int(acc) if acc else None, l1_address=l1,
-                        api_key_index=int(env(f"{prefix}_API_KEY_INDEX", "4")), api_private_key=key))
-    if not out:
-        raise SystemExit("Не задан ни один ключ: RH_API_PRIVATE_KEY и/или CORE_API_PRIVATE_KEY (см. .env.example)")
-    return out
+            raise SystemExit(f"Кошелёк #{n}: укажи адрес W{n}_ADDRESS (или {prefix}ACCOUNT_INDEX)")
+        w = wallets.setdefault(n, {"wallet": n, "name": name, "exchanges": []})
+        w["exchanges"].append(dict(network=net, account_index=int(acc) if acc else None, l1_address=l1,
+                                   api_key_index=int(env(f"{prefix}API_KEY_INDEX", "4")),
+                                   api_private_key=key, wallet=n, wallet_name=name))
+
+    # старый формат без номера → кошелёк №1
+    if env("RH_API_PRIVATE_KEY") or env("CORE_API_PRIVATE_KEY"):
+        l1 = env("ADDRESS")
+        add(1, "RH_", "RH", "robinhood", l1, env("NAME"))
+        add(1, "CORE_", "CORE", "mainnet", l1, env("NAME"))
+    numbers = sorted({int(m.group(1)) for k in os.environ if (m := re.match(r"W(\d+)_", k))})
+    for n in numbers:
+        if n in wallets:
+            raise SystemExit(f"Кошелёк #{n} задан дважды: и через RH_/CORE_, и через W{n}_")
+        l1, name = env(f"W{n}_ADDRESS"), env(f"W{n}_NAME")
+        add(n, f"W{n}_RH_", "RH", "robinhood", l1, name)
+        add(n, f"W{n}_CORE_", "CORE", "mainnet", l1, name)
+    if not wallets:
+        raise SystemExit("Не задан ни один кошелёк: W1_ADDRESS + W1_RH_API_PRIVATE_KEY и/или "
+                         "W1_CORE_API_PRIVATE_KEY (см. .env.example)")
+    return [wallets[n] for n in sorted(wallets)]
 
 
 async def main_async() -> None:
@@ -733,24 +775,31 @@ async def main_async() -> None:
         log.info("Весь трафик идёт через прокси %s", re.sub(r"//[^@/]*@", "//***@", PROXY))
     async with aiohttp.ClientSession(trust_env=True) as http:
         tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"))
-        guardians, tasks = [], []
-        for c in exchange_configs():
-            ex = LighterExchange(http, **c)
-            await ex.start()
-            g = Guardian(ex, cfg, tg.send)
-            ex.guardian = g
-            await ex.refresh_positions()
-            guardians.append(g)
+        guardians, tasks, hedges = [], [], []
+        for w in wallet_configs():
+            wg = []
+            for c in w["exchanges"]:
+                ex = LighterExchange(http, **c)
+                try:
+                    await ex.start()
+                except Exception as e:  # noqa: BLE001
+                    await tg.send(f"❗ <b>{html.escape(ex.label)}</b>: не удалось подключиться — {html.escape(str(e))}")
+                    raise
+                g = Guardian(ex, cfg, tg.send)
+                ex.guardian = g
+                await ex.refresh_positions()
+                wg.append(g)
+            guardians += wg
+            # вилка ищется внутри одного кошелька: его RH ↔ его CORE
+            if len(wg) >= 2 and cfg.hedge != "off":
+                from hedge import HedgeManager
+                hedges.append(HedgeManager({g.ex.label: g for g in wg}, cfg, tg.send, wallet=w["wallet"]))
 
-        hedge = None
-        if len(guardians) >= 2 and cfg.hedge != "off":
-            from hedge import HedgeManager
-            hedge = HedgeManager({g.ex.label: g for g in guardians}, cfg, tg.send)
-
-            async def hedge_ticker():
-                while True:
-                    hedge.spawn(hedge.tick())
-                    await asyncio.sleep(0.25)
+        async def hedge_ticker():
+            while True:
+                for h in hedges:
+                    h.spawn(h.tick())
+                await asyncio.sleep(0.25)
 
         async def ticker(g: Guardian):
             while True:
@@ -767,9 +816,9 @@ async def main_async() -> None:
 
         for g in guardians:
             tasks += [g.ex.stream(), ticker(g), reconcile(g)]
-        if hedge:
+        if hedges:
             tasks.append(hedge_ticker())
-        tasks.append(tg.poll(guardians, hedge))
+        tasks.append(tg.poll(guardians, hedges))
         if env_bool("STARTUP_MESSAGE", True):
             await tg.send("\n\n".join(g.status_text() for g in guardians))
         runner = asyncio.gather(*tasks)

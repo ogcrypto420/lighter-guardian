@@ -48,8 +48,9 @@ class Pair:
 
 
 class HedgeManager:
-    def __init__(self, guardians: dict, cfg, notify):
-        self.g = guardians            # "RH" / "CORE" -> Guardian
+    def __init__(self, guardians: dict, cfg, notify, wallet: int = 1):
+        self.g = guardians            # подпись биржи кошелька ("#1 RH" / "#1 CORE") -> Guardian
+        self.wallet = wallet
         self.cfg = cfg
         self.notify = notify
         self.pairs: list[Pair] = []
@@ -74,8 +75,8 @@ class HedgeManager:
 
     def pairs_text(self) -> str:
         if not self.pairs:
-            return "🔗 Вилок нет. Один и тот же тикер в разные стороны на RH и CORE свяжется сам."
-        lines = ["🔗 <b>Вилки</b>"]
+            return f"🔗 Кошелёк #{self.wallet}: вилок нет. Один тикер в разные стороны на RH и CORE свяжется сам."
+        lines = [f"🔗 <b>Вилки кошелька #{self.wallet}</b>"]
         for p in self.pairs:
             lines.append(f"<b>{self.name(p.a)}</b> {self.pos(p.a):+g} ↔ <b>{self.name(p.b)}</b> {self.pos(p.b):+g}")
         return "\n".join(lines)

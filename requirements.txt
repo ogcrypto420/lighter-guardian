@@ -1,0 +1,3 @@
+aiohttp>=3.9
+# официальный SDK Lighter (подпись транзакций), зафиксирован на проверенной версии
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@5825eb19867a4dbdd47c02642dc1eec30c30ca73

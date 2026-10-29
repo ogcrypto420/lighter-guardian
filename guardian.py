@@ -84,6 +84,8 @@ class Config:
     failed_stop: str = env_mode("FAILED_STOP", "act")    # 2. стоп отменён биржей
     soft_stop: str = env_mode("SOFT_STOP", "act")        # 3. цена за стопом, а стоп не исполнился
     naked_alert: bool = env_bool("NAKED_ALERT", True)    # 4. позиция без стопа
+    hedge: str = env_mode("HEDGE", "act")                # 5. вилка RH ↔ CORE: закрыть/подрезать вторую ногу
+    hedge_debounce: float = env_float("HEDGE_DEBOUNCE_SEC", 0.7)
     soft_stop_seconds: float = env_float("SOFT_STOP_SECONDS", 5)
     soft_stop_buffer_pct: float = env_float("SOFT_STOP_BUFFER_PCT", 0.05)
     emergency_slippage_pct: float = env_float("EMERGENCY_SLIPPAGE_PCT", 1.0)
@@ -190,6 +192,7 @@ class Guardian:
         self.closing: set[int] = set()
         self.paused = False
         self.positions_ready = False
+        self.hedged: set[int] = set()               # рынки, где позиция — нога вилки
         self.pos_ts: dict[int, float] = {}          # когда позиция в последний раз пришла по WebSocket
         self._bg: set[asyncio.Task] = set()
 
@@ -297,7 +300,7 @@ class Guardian:
             stops = self.stops_for(mid, pos)
             if not stops:
                 self.soft_since.pop(mid, None)
-                if self.cfg.naked_alert and self.tied.get(mid, 0) == 0:
+                if self.cfg.naked_alert and self.tied.get(mid, 0) == 0 and mid not in self.hedged:
                     since = self.naked_since.setdefault(mid, now)
                     if now - since >= self.cfg.naked_alert_min * 60 and mid not in self.naked_alerted:
                         self.naked_alerted.add(mid)
@@ -434,7 +437,7 @@ class Guardian:
                          f"{px}\n   SL: {sl} · TP: {tp}")
         lines.append(f"\nСценарии: висящие ордера — {cfg.cleanup}, отменённый стоп — {cfg.failed_stop}, "
                      f"стоп не сработал — {cfg.soft_stop} ({cfg.soft_stop_seconds:g} с), "
-                     f"без стопа — {'on' if cfg.naked_alert else 'off'}")
+                     f"без стопа — {'on' if cfg.naked_alert else 'off'}, вилка RH↔CORE — {cfg.hedge}")
         return "\n".join(lines)
 
 
@@ -639,11 +642,12 @@ class Telegram:
         except Exception as e:  # noqa: BLE001
             log.warning("Telegram: %s", e)
 
-    async def poll(self, guardians: list[Guardian]) -> None:
+    async def poll(self, guardians: list[Guardian], hedge=None) -> None:
         if not (self.token and self.chat_id):
             return
         await self.call("setMyCommands", commands=[
             {"command": "status", "description": "Позиции и стопы"},
+            {"command": "pairs", "description": "Вилки RH ↔ CORE"},
             {"command": "pause", "description": "Только алерты, без действий"},
             {"command": "resume", "description": "Снова действовать"},
         ])
@@ -657,7 +661,13 @@ class Telegram:
                         continue      # отвечаем только владельцу
                     cmd = (msg.get("text") or "").split("@")[0].strip().lower()
                     if cmd == "/status" or cmd == "/start":
-                        await self.send("\n\n".join(g.status_text() for g in guardians))
+                        parts = [g.status_text() for g in guardians]
+                        if hedge:
+                            parts.append(hedge.pairs_text())
+                        await self.send("\n\n".join(parts))
+                    elif cmd == "/pairs":
+                        await self.send(hedge.pairs_text() if hedge else
+                                        "Вилки работают, когда подключены обе биржи: RH и CORE.")
                     elif cmd == "/pause":
                         for g in guardians:
                             g.paused = True
@@ -711,6 +721,16 @@ async def main_async() -> None:
             await ex.refresh_positions()
             guardians.append(g)
 
+        hedge = None
+        if len(guardians) >= 2 and cfg.hedge != "off":
+            from hedge import HedgeManager
+            hedge = HedgeManager({g.ex.label: g for g in guardians}, cfg, tg.send)
+
+            async def hedge_ticker():
+                while True:
+                    hedge.spawn(hedge.tick())
+                    await asyncio.sleep(0.25)
+
         async def ticker(g: Guardian):
             while True:
                 await g.run_actions(g.tick())
@@ -726,7 +746,9 @@ async def main_async() -> None:
 
         for g in guardians:
             tasks += [g.ex.stream(), ticker(g), reconcile(g)]
-        tasks.append(tg.poll(guardians))
+        if hedge:
+            tasks.append(hedge_ticker())
+        tasks.append(tg.poll(guardians, hedge))
         if env_bool("STARTUP_MESSAGE", True):
             await tg.send("\n\n".join(g.status_text() for g in guardians))
         runner = asyncio.gather(*tasks)

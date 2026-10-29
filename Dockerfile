@@ -3,6 +3,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY guardian.py setup_key.py ./
+COPY guardian.py hedge.py setup_key.py ./
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "guardian.py"]

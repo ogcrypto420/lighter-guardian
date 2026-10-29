@@ -84,10 +84,13 @@ def env_mode(name: str, default: str) -> str:
 
 NETWORKS = {
     # имя: (REST, WebSocket, chain id, подпись в сообщениях)
-    "robinhood": ("https://api.rh.lighter.xyz", "wss://api.rh.lighter.xyz/stream", 466324, "RH"),
-    "robinhood_testnet": ("https://api.rh-testnet.lighter.xyz", "wss://api.rh-testnet.lighter.xyz/stream", 300, "RH-TEST"),
-    "mainnet": ("https://mainnet.zklighter.elliot.ai", "wss://mainnet.zklighter.elliot.ai/stream", 304, "CORE"),
-    "testnet": ("https://testnet.zklighter.elliot.ai", "wss://testnet.zklighter.elliot.ai/stream", 300, "CORE-TEST"),
+    # WebSocket — только чтение (?readonly=true): без этого Lighter отвечает 400. Транзакции идут через REST.
+    "robinhood": ("https://api.rh.lighter.xyz", "wss://api.rh.lighter.xyz/stream?readonly=true", 466324, "RH"),
+    "robinhood_testnet": ("https://api.rh-testnet.lighter.xyz", "wss://api.rh-testnet.lighter.xyz/stream?readonly=true",
+                          300, "RH-TEST"),
+    "mainnet": ("https://mainnet.zklighter.elliot.ai", "wss://mainnet.zklighter.elliot.ai/stream?readonly=true", 304, "CORE"),
+    "testnet": ("https://testnet.zklighter.elliot.ai", "wss://testnet.zklighter.elliot.ai/stream?readonly=true",
+                300, "CORE-TEST"),
 }
 TELEGRAM_HOST = "api.telegram.org"
 # Единственные адреса, куда страж может ходить в сеть
@@ -109,6 +112,9 @@ class Config:
     emergency_tries: int = int(env_float("EMERGENCY_TRIES", 3))
     naked_alert_min: float = env_float("NAKED_ALERT_MIN", 2)
     cleanup_delay: float = env_float("CLEANUP_DELAY_SEC", 1.5)
+    # мягкий стоп не закрывает сам, если стакан шире этого (%): только алерт — защита от «дыр» в тонком стакане
+    soft_stop_max_spread_pct: float = env_float("SOFT_STOP_MAX_SPREAD_PCT", 2.0)
+    retry_pause_sec: float = env_float("EMERGENCY_RETRY_PAUSE_SEC", 60)   # пауза после неудачного закрытия
 
 
 SL_TYPES = {"stop-loss", "stop-loss-limit"}
@@ -221,6 +227,9 @@ class Guardian:
         self.positions_ready = False
         self.hedged: set[int] = set()               # рынки, где позиция — нога вилки
         self.pos_ts: dict[int, float] = {}          # когда позиция в последний раз пришла по WebSocket
+        self.orders_ts: dict[int, float] = {}       # когда ордера рынка в последний раз пришли по WebSocket
+        self.soft_alerted: set[int] = set()         # о мягком стопе уже предупредили (алерт / DRY_RUN) — не повторяем
+        self.retry_after: dict[int, float] = {}     # market -> раньше этого времени повторно не закрываем
         self._bg: set[asyncio.Task] = set()
 
     def spawn(self, actions: list[tuple]) -> None:
@@ -234,7 +243,7 @@ class Guardian:
     # ---------- вспомогательное ----------
     def sym(self, mid: int) -> str:
         m = self.ex.markets.get(mid)
-        return f"{T(m.symbol if m else mid)} · {self.ex.label}"
+        return f"{T(html.escape(str(m.symbol if m else mid)))} · {html.escape(self.ex.label)}"
 
     def mode(self, scenario: str) -> str:
         m = getattr(self.cfg, scenario)
@@ -274,17 +283,23 @@ class Guardian:
             if new == 0 or (old != 0 and (old > 0) != (new > 0)):
                 self.naked_since.pop(mid, None)
                 self.naked_alerted.discard(mid)
+                self.soft_alerted.discard(mid)
+                self.retry_after.pop(mid, None)
             if new != 0:
                 self.pending_cleanup.pop(mid, None)
         self.positions_ready = True
 
-    def on_orders(self, orders: list[Order], snapshot: bool = False) -> list[tuple]:
+    def on_orders(self, orders: list[Order], snapshot: bool = False, now: float | None = None) -> list[tuple]:
         """Возвращает список действий [("emergency", mid, причина)] для отменённых биржей стопов."""
+        now = time.time() if now is None else now
         if snapshot:
-            self.orders = {o.index: o for o in orders if o.active}
-            return []
+            new = {o.index: o for o in orders if o.active}
+            actions = self._vanished_stops(set(self.positions), new, now)
+            self.orders = new
+            return actions
         actions = []
         for o in orders:
+            self.orders_ts[o.market] = now
             if o.active:
                 self.orders[o.index] = o
                 continue
@@ -298,6 +313,37 @@ class Guardian:
                 else:
                     actions.append(("alert", o.market, f"⚠️ {self.sym(o.market)}: {reason}. "
                                                          f"Триггер {num(o.trigger_price)}.", "failed_stop"))
+        return actions
+
+    def sync_orders(self, mid: int, orders: list[Order], now: float | None = None) -> list[tuple]:
+        """Сверка ордеров одного рынка по REST: убирает «призраков» (если событие отмены потерялось)
+        и ловит стоп, который исчез, хотя цена уже за ним."""
+        now = time.time() if now is None else now
+        if now - self.orders_ts.get(mid, 0) < 5:
+            return []                     # по WebSocket только что пришло свежее — REST может отставать
+        others = {i: o for i, o in self.orders.items() if o.market != mid}
+        new = {**others, **{o.index: o for o in orders if o.active and o.market == mid}}
+        actions = self._vanished_stops({mid}, new, now)
+        self.orders = new
+        return actions
+
+    def _vanished_stops(self, mids, new_orders: dict[int, Order], now: float) -> list[tuple]:
+        """Стоп пропал без события отмены (например, пока переподключались), позиция открыта,
+        а mark уже за его триггером — значит, стоп сработал, но позицию не закрыл."""
+        actions = []
+        for mid in mids:
+            pos = self.positions.get(mid, 0.0)
+            q = self.quotes.get(mid)
+            if pos == 0 or mid in self.closing or not q or not q.mark or now - q.ts > 30:
+                continue
+            gone = [o for o in self.stops_for(mid, pos) if o.index not in new_orders]
+            crossed = [o for o in gone if (q.mark <= o.trigger_price if pos > 0 else q.mark >= o.trigger_price)]
+            still = [o for o in new_orders.values()
+                     if o.market == mid and o.type in SL_TYPES and o.closes(pos) and not o.waiting_parent]
+            if crossed and not still:
+                actions.append(("emergency", mid, f"Стоп {num(crossed[0].trigger_price)} пропал, а mark "
+                                                  f"{num(q.mark)} уже за триггером — похоже, стоп сработал, "
+                                                  "но позицию не закрыл", "failed_stop"))
         return actions
 
     def on_quote(self, mid: int, bid: float, ask: float, mark: float, now: float | None = None) -> None:
@@ -337,25 +383,40 @@ class Guardian:
                 continue
             self.naked_since.pop(mid, None)
             q = self.quotes.get(mid)
-            if not q or now - q.ts > 30 or not (q.bid and q.ask):
+            if not q or now - q.ts > 30 or not (q.bid and q.ask) or q.ask <= q.bid:
                 continue
             buf = self.cfg.soft_stop_buffer_pct / 100
-            if pos > 0:   # лонг: стоп ниже цены; смотрим, по чему можно продать (bid)
+            mid_px = (q.bid + q.ask) / 2
+            # пробой — когда за стопом и цена, по которой закроемся, и середина стакана:
+            # одна «дыра» на стороне bid/ask в тонком стакане пробоем не считается
+            if pos > 0:   # лонг: стоп ниже цены; продаём по bid
                 trig = max(s.trigger_price for s in stops)
-                breached, px = q.bid <= trig * (1 - buf), q.bid
-            else:         # шорт: стоп выше цены; смотрим, по чему можно купить (ask)
+                breached, px = q.bid <= trig * (1 - buf) and mid_px <= trig, q.bid
+            else:         # шорт: стоп выше цены; покупаем по ask
                 trig = min(s.trigger_price for s in stops)
-                breached, px = q.ask >= trig * (1 + buf), q.ask
+                breached, px = q.ask >= trig * (1 + buf) and mid_px >= trig, q.ask
             if not breached:
                 self.soft_since.pop(mid, None)
+                self.soft_alerted.discard(mid)
+                continue
+            if mid in self.soft_alerted or now < self.retry_after.get(mid, 0):
                 continue
             since = self.soft_since.setdefault(mid, now)
             if now - since >= self.cfg.soft_stop_seconds:
                 self.soft_since.pop(mid, None)
                 where = "ниже" if pos > 0 else "выше"
-                actions.append(("emergency", mid,
-                                f"Стоп не сработал: цена в стакане {num(px)} {where} триггера {num(trig)} "
-                                f"уже {now - since:.0f} с (mark {num(q.mark)})", "soft_stop"))
+                reason = (f"Стоп не сработал: цена в стакане {num(px)} {where} триггера {num(trig)} "
+                          f"уже {now - since:.0f} с (mark {num(q.mark)})")
+                spread_pct = (q.ask - q.bid) / mid_px * 100
+                if spread_pct > self.cfg.soft_stop_max_spread_pct:
+                    self.soft_alerted.add(mid)
+                    actions.append(("alert", mid, f"⚠️ <b>{self.sym(mid)}</b>: {reason}. Но стакан слишком широкий "
+                                                  f"(спред {num(spread_pct, 2)}%) — сам не закрываю, проверь вручную.",
+                                    "soft_stop"))
+                    continue
+                if self.mode("soft_stop") != "act" or self.cfg.dry_run:
+                    self.soft_alerted.add(mid)       # в режиме алерта / DRY_RUN — одно сообщение на пробой
+                actions.append(("emergency", mid, reason, "soft_stop"))
         return actions
 
     # ---------- исполнение действий ----------
@@ -420,10 +481,9 @@ class Guardian:
                 if pos == 0:
                     break
                 slip = self.cfg.emergency_slippage_pct * attempt / 100
-                q = self.quotes.get(mid)
-                ref = (q.bid if pos > 0 else q.ask) if q else 0
+                ref = await self.close_ref(mid, is_ask=pos > 0)
                 if not ref:
-                    ref = await self.ex.best_price(mid, is_ask=pos > 0)
+                    raise RuntimeError("нет цены в стакане — закрывать по рынку вслепую не буду, закрой вручную")
                 worst = ref * (1 - slip) if pos > 0 else ref * (1 + slip)
                 ok, err = await self.ex.market_close(mid, abs(pos), is_ask=pos > 0, worst_price=worst)
                 if not ok:
@@ -441,11 +501,32 @@ class Guardian:
                     return
             left = self.positions.get(mid, 0.0)
             if left != 0:
+                self.retry_after[mid] = time.time() + self.cfg.retry_pause_sec
                 await self.notify(f"❗❗ <b>{self.sym(mid)}</b>: НЕ удалось закрыть позицию за "
                                   f"{self.cfg.emergency_tries} попыток, осталось {num(abs(left))}. "
-                                  "Закрой вручную!")
+                                  f"Закрой вручную! (Повторю не раньше чем через {self.cfg.retry_pause_sec:g} с.)")
+        except Exception:
+            self.retry_after[mid] = time.time() + self.cfg.retry_pause_sec
+            raise
         finally:
             self.closing.discard(mid)
+
+    async def close_ref(self, mid: int, is_ask: bool) -> float:
+        """Цена, от которой считаем допуск закрытия: свежая из потока, иначе — из стакана по REST."""
+        q = self.quotes.get(mid)
+        if q and time.time() - q.ts < 5:
+            ref = q.bid if is_ask else q.ask
+            if ref:
+                return ref
+        try:
+            ref = await self.ex.best_price(mid, is_ask=is_ask)
+            if ref:
+                return ref
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: цена из стакана: %s", self.ex.label, redact(str(e)))
+        if q and time.time() - q.ts < 60:
+            return (q.bid if is_ask else q.ask) or 0.0
+        return 0.0
 
     def status_text(self) -> str:
         cfg = self.cfg
@@ -493,6 +574,9 @@ class LighterExchange:
         self.guardian: Guardian | None = None
         self._coi = int(time.time() * 1000) % (1 << 40)
         self._tx_lock = asyncio.Lock()      # одна транзакция за раз: nonce идут строго по порядку
+        self.last_msg = time.time()         # когда последний раз что-то пришло по WebSocket
+        self.sub_error = ""                 # биржа отказала в подписке на ордера/позиции
+        self._token: tuple[str, float] = ("", 0.0)
 
     def _timeout(self, total: float = 20):
         import aiohttp
@@ -515,8 +599,9 @@ class LighterExchange:
                 raise RuntimeError(f"Аккаунт для кошелька не найден на {self.label}")
             self.account_index = int(min(subs, key=lambda s: int(s["index"]))["index"])
         await self.load_markets()
-        self.signer = Signer(self.account_index, self.api_key_index, self._api_private_key, self.chain_id)
-        self._api_private_key = None        # дальше ключ живёт только внутри модуля подписи
+        if self.signer is None:
+            self.signer = Signer(self.account_index, self.api_key_index, self._api_private_key, self.chain_id)
+            self._api_private_key = None    # дальше ключ живёт только внутри модуля подписи
         await self.verify_key()
         log.info("%s: аккаунт %s, ключ %s — ок, рынков %d%s", self.label, self.account_index,
                  self.api_key_index, len(self.markets),
@@ -525,8 +610,10 @@ class LighterExchange:
     async def verify_key(self) -> None:
         """Проверка ключа: закрытый запрос с подписанным токеном. Ошибка — если ключ не тот."""
         token = self.auth_token(600)
-        async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
-                                 params={"account_index": self.account_index},
+        params = {"account_index": self.account_index}
+        if self.markets:
+            params["market_id"] = min(self.markets)
+        async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders", params=params,
                                  headers={"authorization": token}, proxy=self.proxy,
                                  timeout=self._timeout()) as r:
             data = await r.json(content_type=None)
@@ -545,6 +632,25 @@ class LighterExchange:
         token = self.signer.auth_token(int(time.time()) + seconds)
         register_secret(token)
         return token
+
+    def rest_token(self) -> str:
+        """Токен для закрытых REST-запросов: живёт 10 минут, обновляем раз в 5."""
+        tok, made = self._token
+        if not tok or time.time() - made > 300:
+            self._token = (self.auth_token(600), time.time())
+        return self._token[0]
+
+    async def fetch_active_orders(self, mid: int) -> list[Order] | None:
+        """Активные ордера одного рынка по REST (для сверки). None — если биржа не ответила как надо."""
+        async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
+                                 params={"account_index": self.account_index, "market_id": mid},
+                                 headers={"authorization": self.rest_token()}, proxy=self.proxy,
+                                 timeout=self._timeout()) as r:
+            data = await r.json(content_type=None)
+        if r.status >= 400 or not isinstance(data, dict) or int(data.get("code", 200)) != 200 \
+                or not isinstance(data.get("orders"), list):
+            return None
+        return [Order.parse(d, mid) for d in data["orders"]]
 
     def _next_coi(self) -> int:
         self._coi = (self._coi + 1) % (1 << 40)
@@ -583,7 +689,11 @@ class LighterExchange:
         return float(side[0]["price"]) if side else 0.0
 
     async def market_close(self, mid: int, size: float, is_ask: bool, worst_price: float) -> tuple[bool, str]:
+        if mid not in self.markets:          # рынок появился после запуска
+            await self.load_markets()
         m = self.markets[mid]
+        if worst_price <= 0:
+            return False, "нет цены"
         base = int(round(size * 10 ** m.size_decimals))
         # округляем цену в «безопасную» сторону, чтобы не сузить допуск
         scale = 10 ** m.price_decimals
@@ -591,13 +701,31 @@ class LighterExchange:
         coi = self._next_coi()
         return await self._send(lambda n: self.signer.market_order(mid, coi, base, price, is_ask, True, n))
 
-    async def refresh_positions(self) -> None:
+    async def _fetch_positions(self) -> tuple[dict, dict] | None:
         data = await self.get("account", by="index", value=str(self.account_index))
         accs = data.get("accounts") or []
-        if not accs or not self.guardian:
+        if not accs or not isinstance(accs[0].get("positions"), list):
+            return None
+        return parse_positions(accs[0]["positions"])
+
+    async def refresh_positions(self) -> None:
+        g = self.guardian
+        got = await self._fetch_positions() if g else None
+        if got is None:
             return
-        pos, tied = parse_positions(accs[0].get("positions") or [])
-        self.guardian.on_positions(pos, tied, snapshot=True, source="rest")
+        pos, tied = got
+        # REST говорит «позиция закрыта» — перепроверяем ещё раз: случайный сбой API не должен
+        # выглядеть как закрытие (иначе отменили бы стопы и закрыли вторую ногу вилки)
+        gone = [m for m, p in g.positions.items() if p != 0 and pos.get(m, 0.0) == 0]
+        if gone:
+            await asyncio.sleep(1.5)
+            again = await self._fetch_positions()
+            if again is None:
+                return
+            for m in gone:
+                if again[0].get(m, 0.0) != 0:
+                    pos[m] = again[0][m]
+        g.on_positions(pos, tied, snapshot=True, source="rest")
 
     async def stream(self) -> None:
         """WebSocket: ордера, позиции, цены. Переподключение раз в 50 минут — чтобы обновить токен."""
@@ -608,6 +736,7 @@ class LighterExchange:
                 token = self.auth_token(3600)
                 async with self.http.ws_connect(self.ws_url, heartbeat=None, max_msg_size=0,
                                                 proxy=self.proxy) as ws:
+                    self.last_msg = time.time()
                     acc = self.account_index
                     for ch in (f"account_all_positions/{acc}", f"account_all_orders/{acc}"):
                         await ws.send_json({"type": "subscribe", "channel": ch, "auth": token})
@@ -625,7 +754,11 @@ class LighterExchange:
                             await ws.send_json({"type": "ping"})
                             last_ping = time.time()
                         if msg is None:
+                            if time.time() - self.last_msg > 90:     # соединение «висит» молча
+                                log.warning("%s: WebSocket молчит 90 с — переподключаюсь", self.label)
+                                break
                             continue
+                        self.last_msg = time.time()
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR,
                                             aiohttp.WSMsgType.CLOSING):
@@ -647,6 +780,8 @@ class LighterExchange:
             pos, tied = parse_positions(msg.get("positions") or {})
             g.on_positions(pos, tied, snapshot=snap)
         elif t.endswith("account_all_orders"):
+            if snap:
+                self.sub_error = ""
             orders = []
             for mkt, lst in (msg.get("orders") or {}).items():
                 for d in lst or []:
@@ -662,7 +797,11 @@ class LighterExchange:
                 except (KeyError, TypeError, ValueError):
                     pass
         elif "error" in msg:
-            log.warning("%s: WebSocket: %s", self.label, redact(str(msg.get("error"))))
+            err = msg.get("error")
+            text = redact(str(err.get("message") if isinstance(err, dict) else err))
+            log.warning("%s: WebSocket: %s", self.label, text)
+            if "account_all" in text:
+                self.sub_error = text
 
 
 def parse_positions(raw) -> tuple[dict[int, float], dict[int, int]]:
@@ -706,11 +845,17 @@ class Telegram:
         log.info("TG: %s", redact(re.sub(r"<[^>]+>", "", strip_marks(text))))
         if not (self.token and self.chat_id):
             return
-        try:
-            await self.call("sendMessage", chat_id=self.chat_id, text=redact(render(text, self.detail))[:4000],
-                            parse_mode="HTML", disable_web_page_preview=True)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Telegram: %s", e)
+        for chunk in split_message(redact(render(text, self.detail))):
+            try:
+                r = await self.call("sendMessage", chat_id=self.chat_id, text=chunk, parse_mode="HTML",
+                                    disable_web_page_preview=True)
+                if isinstance(r, dict) and not r.get("ok"):
+                    # например, HTML не разобрался — шлём простым текстом, чтобы важное сообщение не потерялось
+                    log.warning("Telegram: %s", redact(str(r.get("description"))))
+                    await self.call("sendMessage", chat_id=self.chat_id, disable_web_page_preview=True,
+                                    text=html.unescape(re.sub(r"<[^>]+>", "", chunk)))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Telegram: %s", redact(str(e)))
 
     async def poll(self, guardians: list[Guardian], hedges=()) -> None:
         if not (self.token and self.chat_id):
@@ -722,9 +867,24 @@ class Telegram:
             {"command": "pause", "description": "Только алерты, без действий"},
             {"command": "resume", "description": "Снова действовать"},
         ])
+        try:   # старые команды (пока страж был выключен) не выполняем
+            old = await self.call("getUpdates", offset=-1, timeout=0)
+            if isinstance(old, dict) and old.get("result"):
+                self.offset = old["result"][-1]["update_id"] + 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("Telegram: %s", redact(str(e)))
+        warned = False
         while True:
             try:
                 data = await self.call("getUpdates", offset=self.offset, timeout=30, allowed_updates=["message"])
+                if isinstance(data, dict) and not data.get("ok", True):
+                    log.warning("Telegram getUpdates: %s", redact(str(data.get("description"))))
+                    if data.get("error_code") == 409 and not warned:
+                        warned = True
+                        await self.send("⚠️ Этого Telegram-бота опрашивает ещё одна программа — команды до стража "
+                                        "не доходят. Создай для стража отдельного бота у @BotFather.")
+                    await asyncio.sleep(15)
+                    continue
                 for upd in (data or {}).get("result", []):
                     self.offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
@@ -774,6 +934,28 @@ class Telegram:
             except Exception as e:  # noqa: BLE001
                 log.warning("Telegram polling: %s", e)
                 await asyncio.sleep(5)
+
+
+def split_message(text: str, limit: int = 3900) -> list[str]:
+    """Telegram принимает до 4096 символов: режем по строкам, чтобы не разрывать HTML-теги."""
+    if len(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out
 
 
 # ───────────────────────────── запуск ─────────────────────────────
@@ -842,6 +1024,115 @@ def load_secrets() -> None:
             register_secret(env(k))
 
 
+class Runner:
+    """Запускает биржи независимо друг от друга: если одна не поднялась, остальные уже защищают,
+    а упавшая переподключается в фоне. Все циклы переживают ошибки."""
+
+    def __init__(self, tg: "Telegram", cfg: Config):
+        self.tg, self.cfg = tg, cfg
+        self.guardians: list[Guardian] = []
+        self.hedges: list = []
+        self.by_wallet: dict[int, list[Guardian]] = {}
+        self.tasks: set[asyncio.Task] = set()
+
+    def bg(self, coro) -> None:
+        t = asyncio.create_task(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
+
+    async def start_exchange(self, wallet: int, ex: "LighterExchange") -> None:
+        delay, failed = 30, False
+        while True:
+            try:
+                await ex.start()
+                break
+            except Exception as e:  # noqa: BLE001
+                msg = redact(str(e))
+                log.warning("%s: не удалось подключиться: %s", ex.label, msg)
+                if not failed:
+                    failed = True
+                    await self.tg.send(f"❗ <b>{html.escape(ex.label)}</b>: не удалось подключиться — "
+                                       f"{S(html.escape(msg))}\nПробую снова в фоне; остальные кошельки защищены.")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 300)
+        g = Guardian(ex, self.cfg, self.tg.send)
+        ex.guardian = g
+        try:
+            await ex.refresh_positions()
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: позиции по REST: %s", ex.label, redact(str(e)))
+        self.guardians.append(g)
+        ex.last_msg = time.time()
+        if failed:
+            await self.tg.send(f"✅ <b>{html.escape(ex.label)}</b>: подключился, страж работает.")
+        for coro in (ex.stream(), self.ticker(g), self.reconcile(g), self.health(g)):
+            self.bg(coro)
+        wg = self.by_wallet.setdefault(wallet, [])
+        wg.append(g)
+        # вилка ищется внутри одного кошелька: его RH ↔ его CORE
+        if len(wg) == 2 and self.cfg.hedge != "off":
+            from hedge import HedgeManager
+            self.hedges.append(HedgeManager({x.ex.label: x for x in wg}, self.cfg, self.tg.send, wallet=wallet))
+
+    async def ticker(self, g: Guardian) -> None:
+        while True:
+            try:
+                g.spawn(g.tick())       # действия — в фоне: долгое закрытие не задерживает проверку остальных пар
+            except Exception:  # noqa: BLE001
+                log.exception("%s: проверка", g.ex.label)
+            await asyncio.sleep(0.5)
+
+    async def hedge_ticker(self) -> None:
+        while True:
+            for h in list(self.hedges):
+                try:
+                    h.spawn(h.tick())
+                except Exception:  # noqa: BLE001
+                    log.exception("вилка")
+            await asyncio.sleep(0.25)
+
+    async def reconcile(self, g: Guardian) -> None:
+        """Раз в 30 с — сверка с биржей по REST: позиции и ордера рынков с открытыми позициями."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await g.ex.refresh_positions()
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: сверка позиций: %s", g.ex.label, redact(str(e)))
+            for mid in [m for m, p in g.positions.items() if p != 0]:
+                try:
+                    orders = await g.ex.fetch_active_orders(mid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("%s: сверка ордеров: %s", g.ex.label, redact(str(e)))
+                    break
+                if orders is not None:
+                    g.spawn(g.sync_orders(mid, orders))
+
+    async def health(self, g: Guardian) -> None:
+        """Сообщает, если страж «ослеп»: нет данных от биржи или биржа не даёт подписку на ордера."""
+        ex, down, seen_err = g.ex, False, ""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                silent = time.time() - ex.last_msg
+                if silent > 120 and not down:
+                    down = True
+                    await self.tg.send(f"❗ <b>{html.escape(ex.label)}</b>: нет данных от биржи уже {silent:.0f} с — "
+                                       "страж сейчас не видит позиции. Переподключаюсь…")
+                elif silent < 60 and down:
+                    down = False
+                    await self.tg.send(f"✅ <b>{html.escape(ex.label)}</b>: связь с биржей восстановлена.")
+                if ex.sub_error and ex.sub_error != seen_err:
+                    seen_err = ex.sub_error
+                    await self.tg.send(f"❗ <b>{html.escape(ex.label)}</b>: биржа не даёт подписку на ордера "
+                                       f"или позиции — {S(html.escape(ex.sub_error))}. Проверь API-ключ и время "
+                                       "на компьютере (часы должны быть точными).")
+                elif not ex.sub_error:
+                    seen_err = ""
+            except Exception:  # noqa: BLE001
+                log.exception("health")
+
+
 async def main_async() -> None:
     import aiohttp
     from security import SafeSession, harden_process
@@ -850,69 +1141,32 @@ async def main_async() -> None:
     load_secrets()
     cfg = Config()
     max_runtime = env_float("MAX_RUNTIME_MIN", 0) * 60
-    common_proxy = env("PROXY")
     log.info("Разрешённые адреса: %s", ", ".join(sorted(ALLOWED_HOSTS)))
     # trust_env=False: системные переменные прокси игнорируются — только явно заданные PROXY / W{n}_PROXY
     async with aiohttp.ClientSession(trust_env=False) as raw:
         http = SafeSession(raw, ALLOWED_HOSTS)
-        tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"), proxy=common_proxy,
+        tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"), proxy=env("PROXY"),
                       detail=env("TG_DETAIL", "short").lower())
-        guardians, tasks, hedges = [], [], []
-        for w in wallet_configs():
-            wg = []
-            for c in w["exchanges"]:
-                ex = LighterExchange(http, **c)
-                try:
-                    await ex.start()
-                except Exception as e:  # noqa: BLE001
-                    await tg.send(f"❗ <b>{html.escape(ex.label)}</b>: не удалось подключиться — "
-                                  f"{S(html.escape(redact(str(e))))}")
-                    raise
-                g = Guardian(ex, cfg, tg.send)
-                ex.guardian = g
-                await ex.refresh_positions()
-                wg.append(g)
-            guardians += wg
-            # вилка ищется внутри одного кошелька: его RH ↔ его CORE
-            if len(wg) >= 2 and cfg.hedge != "off":
-                from hedge import HedgeManager
-                hedges.append(HedgeManager({g.ex.label: g for g in wg}, cfg, tg.send, wallet=w["wallet"]))
-        SECRETS.clear()             # ключи уже внутри модуля подписи — копии в памяти Python не нужны
-
-        async def hedge_ticker():
-            while True:
-                for h in hedges:
-                    h.spawn(h.tick())
-                await asyncio.sleep(0.25)
-
-        async def ticker(g: Guardian):
-            while True:
-                await g.run_actions(g.tick())
-                await asyncio.sleep(0.5)
-
-        async def reconcile(g: Guardian):
-            while True:
-                await asyncio.sleep(30)
-                try:
-                    await g.ex.refresh_positions()
-                except Exception as e:  # noqa: BLE001
-                    log.warning("%s: сверка позиций: %s", g.ex.label, e)
-
-        for g in guardians:
-            tasks += [g.ex.stream(), ticker(g), reconcile(g)]
-        if hedges:
-            tasks.append(hedge_ticker())
-        tasks.append(tg.poll(guardians, hedges))
-        if env_bool("STARTUP_MESSAGE", True):
-            await tg.send("\n\n".join(g.status_text() for g in guardians))
-        runner = asyncio.gather(*tasks)
+        runner = Runner(tg, cfg)
+        exchanges = [(w["wallet"], LighterExchange(http, **c)) for w in wallet_configs() for c in w["exchanges"]]
+        SECRETS.clear()             # ключи — внутри объектов бирж (до запуска) и модуля подписи; копии не нужны
+        starters = [asyncio.create_task(runner.start_exchange(n, ex)) for n, ex in exchanges]
+        await asyncio.wait(starters, timeout=60)          # первая попытка для всех; упавшие продолжат в фоне
+        for t in starters:
+            runner.tasks.add(t)
+            t.add_done_callback(runner.tasks.discard)
+        runner.bg(runner.hedge_ticker())
+        runner.bg(tg.poll(runner.guardians, runner.hedges))
+        if env_bool("STARTUP_MESSAGE", True) and runner.guardians:
+            await tg.send("\n\n".join(g.status_text() for g in runner.guardians))
+        forever = asyncio.Event()
         if max_runtime > 0:
             try:
-                await asyncio.wait_for(runner, timeout=max_runtime)
+                await asyncio.wait_for(forever.wait(), timeout=max_runtime)
             except asyncio.TimeoutError:
                 log.info("Плановое завершение (MAX_RUNTIME_MIN)")
         else:
-            await runner
+            await forever.wait()
 
 
 def main() -> None:

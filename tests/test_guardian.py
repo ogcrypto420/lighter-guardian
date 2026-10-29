@@ -25,7 +25,9 @@ class FakeExchange:
         return True, ""
 
     async def best_price(self, mid, is_ask):
-        return 100.0
+        # как стакан по REST: лучшая цена из последней котировки
+        q = self.g.quotes.get(mid) if self.g else None
+        return (q.bid if is_ask else q.ask) if q else 100.0
 
     async def market_close(self, mid, size, is_ask, worst_price):
         self.closes.append((mid, size, is_ask, round(worst_price, 4)))

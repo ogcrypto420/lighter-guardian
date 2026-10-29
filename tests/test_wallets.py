@@ -83,6 +83,8 @@ def test_telegram_commands():
     async def fake_call(method, **p):
         if method != "getUpdates":
             return {"ok": True}
+        if p.get("offset") == -1:                       # старые команды при запуске пропускаем
+            return {"ok": True, "result": [{"update_id": 0, "message": {"chat": {"id": 777}, "text": "/pause"}}]}
         try:
             t = next(texts)
         except StopIteration:

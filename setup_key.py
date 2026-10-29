@@ -98,9 +98,12 @@ def register(http: Http, network: str, eth_key: str, address: str, index: int, a
         raise RuntimeError(f"регистрация не прошла: {resp.get('message') or resp}")
     print(f"  {label}: ключ отправлен, жду подтверждения…")
     token = signer.auth_token(int(time.time()) + 600)
+    mk = http.get(f"{api}/api/v1/orderBookDetails", filter="perp").get("order_book_details") or []
+    extra = {"market_id": min(int(m["market_id"]) for m in mk)} if mk else {}
     for _ in range(12):
         time.sleep(5)
-        r = http.get(f"{api}/api/v1/accountActiveOrders", headers={"authorization": token}, account_index=account)
+        r = http.get(f"{api}/api/v1/accountActiveOrders", headers={"authorization": token}, account_index=account,
+                     **extra)
         if int(r.get("code", r.get("_http", 0))) == 200:
             return account, priv
     raise RuntimeError("ключ не подтвердился за минуту, попробуй позже")

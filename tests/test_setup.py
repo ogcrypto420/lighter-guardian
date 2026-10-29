@@ -31,8 +31,11 @@ class FakeLighter:
             return {"code": 200, "sub_accounts": [{"index": 281}, {"index": 99}]}
         if url.endswith("nextNonce"):
             return {"code": 200, "nonce": 3}
+        if url.endswith("orderBookDetails"):
+            return {"code": 200, "order_book_details": [{"market_id": 8}, {"market_id": 3}]}
         if url.endswith("accountActiveOrders"):
             assert headers["authorization"].split(":")[1:3] == [str(p["account_index"]), "6"]
+            assert p.get("market_id") == 3, p                         # проверка ключа — с номером рынка
             return {"code": 200, "orders": []}
         raise AssertionError(url)
 

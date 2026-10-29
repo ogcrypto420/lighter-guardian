@@ -66,7 +66,7 @@ class HedgeManager:
     def name(self, leg: Leg) -> str:
         g = self.g.get(leg[0])
         m = g.ex.markets.get(leg[1]) if g else None
-        return f"{T(m.symbol if m else leg[1])}·{leg[0]}"
+        return f"{T(html.escape(str(m.symbol if m else leg[1])))}·{html.escape(leg[0])}"
 
     def in_pair(self, leg: Leg) -> Pair | None:
         return next((p for p in self.pairs if leg in p.legs()), None)
@@ -211,10 +211,9 @@ class HedgeManager:
             if send <= 0:
                 break
             slip = self.cfg.emergency_slippage_pct * attempt / 100
-            q = g.quotes.get(other[1])
-            ref = (q.bid if ocur > 0 else q.ask) if q else 0
+            ref = await g.close_ref(other[1], is_ask=ocur > 0)
             if not ref:
-                ref = await ex.best_price(other[1], is_ask=ocur > 0)
+                raise RuntimeError(f"нет цены в стакане {self.name(other)} — закрывать вслепую не буду, сделай вручную")
             worst = ref * (1 - slip) if ocur > 0 else ref * (1 + slip)
             ok, err = await ex.market_close(other[1], send, is_ask=ocur > 0, worst_price=worst)
             if not ok:

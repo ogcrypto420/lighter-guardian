@@ -175,6 +175,11 @@ class Quote:
     ts: float = 0.0
 
 
+def mask_proxy(p: str) -> str:
+    """http://user:pass@host:port → host:port (пароль в логи и Telegram не попадает)."""
+    return re.sub(r"^\w+://", "", re.sub(r"//[^@/]*@", "//", p)) if p else ""
+
+
 def fmt(x: float, nd: int = 4) -> str:
     return f"{x:.{nd}f}".rstrip("0").rstrip(".") if x else "0"
 
@@ -454,8 +459,9 @@ class LighterExchange:
     """REST + WebSocket Lighter и подпись транзакций через официальный lighter-sdk."""
 
     def __init__(self, http, network: str, account_index: int | None, api_key_index: int, api_private_key: str,
-                 l1_address: str = "", wallet: int = 1, wallet_name: str = ""):
+                 l1_address: str = "", wallet: int = 1, wallet_name: str = "", proxy: str = ""):
         self.http = http
+        self.proxy = proxy or None          # свой прокси кошелька (или общий PROXY)
         self.network = network
         self.api_url, self.ws_url, self.chain_id, self.venue = NETWORKS[network]
         self.wallet = wallet
@@ -472,7 +478,7 @@ class LighterExchange:
 
     async def get(self, path: str, **params):
         import aiohttp
-        async with self.http.get(f"{self.api_url}/api/v1/{path}", params=params,
+        async with self.http.get(f"{self.api_url}/api/v1/{path}", params=params, proxy=self.proxy,
                                  timeout=aiohttp.ClientTimeout(total=20)) as r:
             data = await r.json(content_type=None)
             if r.status >= 400:
@@ -491,9 +497,13 @@ class LighterExchange:
         self.signer = lighter.SignerClient(url=self.api_url, account_index=self.account_index,
                                            api_private_keys={self.api_key_index: self.api_private_key},
                                            chain_id=self.chain_id)
+        if self.proxy:   # отправка ордеров и nonce через SDK — тоже через прокси этого кошелька
+            self.signer.api_client.configuration.proxy = self.proxy
+            self.signer.api_client.rest_client.proxy = self.proxy
         await self.verify_key()
-        log.info("%s: аккаунт %s, ключ %s — ок, рынков %d", self.label, self.account_index,
-                 self.api_key_index, len(self.markets))
+        log.info("%s: аккаунт %s, ключ %s — ок, рынков %d%s", self.label, self.account_index,
+                 self.api_key_index, len(self.markets),
+                 f", прокси {mask_proxy(self.proxy)}" if self.proxy else "")
 
     async def verify_key(self) -> None:
         """Проверка ключа запросом с подписанным токеном (через наш HTTP-клиент — работает и через прокси)."""
@@ -501,7 +511,7 @@ class LighterExchange:
         token = self.auth_token(600)
         async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
                                  params={"account_index": self.account_index},
-                                 headers={"authorization": token},
+                                 headers={"authorization": token}, proxy=self.proxy,
                                  timeout=aiohttp.ClientTimeout(total=20)) as r:
             data = await r.json(content_type=None)
         if r.status >= 400 or (isinstance(data, dict) and int(data.get("code", 200)) != 200):
@@ -566,7 +576,7 @@ class LighterExchange:
             try:
                 token = self.auth_token(3600)
                 async with self.http.ws_connect(self.ws_url, heartbeat=None, max_msg_size=0,
-                                                proxy=PROXY or None) as ws:
+                                                proxy=self.proxy) as ws:
                     acc = self.account_index
                     for ch in (f"account_all_positions/{acc}", f"account_all_orders/{acc}"):
                         await ws.send_json({"type": "subscribe", "channel": ch, "auth": token})
@@ -705,7 +715,8 @@ class Telegram:
                         rows = {}
                         for g in guardians:
                             rows.setdefault(g.ex.wallet, []).append(
-                                f"{g.ex.venue} (аккаунт {g.ex.account_index}){' ⏸' if g.paused else ''}")
+                                f"{g.ex.venue} (аккаунт {g.ex.account_index}"
+                                f"{', прокси ' + mask_proxy(g.ex.proxy) if g.ex.proxy else ''}){' ⏸' if g.paused else ''}")
                         names = {g.ex.wallet: g.ex.wallet_name for g in guardians}
                         await self.send("👛 <b>Кошельки</b>\n" + "\n".join(
                             f"#{n}{' ' + html.escape(names[n]) if names[n] else ''}: {', '.join(v)}"
@@ -733,7 +744,7 @@ def wallet_configs() -> list[dict]:
     Старый формат RH_* / CORE_* без номера считается кошельком №1."""
     wallets: dict[int, dict] = {}
 
-    def add(n: int, prefix: str, venue: str, default_net: str, shared_l1: str, name: str):
+    def add(n: int, prefix: str, venue: str, default_net: str, shared_l1: str, name: str, proxy: str):
         key = env(f"{prefix}API_PRIVATE_KEY")
         if not key:
             return
@@ -747,20 +758,22 @@ def wallet_configs() -> list[dict]:
         w = wallets.setdefault(n, {"wallet": n, "name": name, "exchanges": []})
         w["exchanges"].append(dict(network=net, account_index=int(acc) if acc else None, l1_address=l1,
                                    api_key_index=int(env(f"{prefix}API_KEY_INDEX", "4")),
-                                   api_private_key=key, wallet=n, wallet_name=name))
+                                   api_private_key=key, wallet=n, wallet_name=name,
+                                   proxy=env(f"{prefix}PROXY") or proxy))
 
     # старый формат без номера → кошелёк №1
     if env("RH_API_PRIVATE_KEY") or env("CORE_API_PRIVATE_KEY"):
         l1 = env("ADDRESS")
-        add(1, "RH_", "RH", "robinhood", l1, env("NAME"))
-        add(1, "CORE_", "CORE", "mainnet", l1, env("NAME"))
+        add(1, "RH_", "RH", "robinhood", l1, env("NAME"), PROXY)
+        add(1, "CORE_", "CORE", "mainnet", l1, env("NAME"), PROXY)
     numbers = sorted({int(m.group(1)) for k in os.environ if (m := re.match(r"W(\d+)_", k))})
     for n in numbers:
         if n in wallets:
             raise SystemExit(f"Кошелёк #{n} задан дважды: и через RH_/CORE_, и через W{n}_")
         l1, name = env(f"W{n}_ADDRESS"), env(f"W{n}_NAME")
-        add(n, f"W{n}_RH_", "RH", "robinhood", l1, name)
-        add(n, f"W{n}_CORE_", "CORE", "mainnet", l1, name)
+        proxy = env(f"W{n}_PROXY") or PROXY          # свой прокси кошелька, иначе общий
+        add(n, f"W{n}_RH_", "RH", "robinhood", l1, name, proxy)
+        add(n, f"W{n}_CORE_", "CORE", "mainnet", l1, name, proxy)
     if not wallets:
         raise SystemExit("Не задан ни один кошелёк: W1_ADDRESS + W1_RH_API_PRIVATE_KEY и/или "
                          "W1_CORE_API_PRIVATE_KEY (см. .env.example)")
@@ -772,7 +785,7 @@ async def main_async() -> None:
     cfg = Config()
     max_runtime = env_float("MAX_RUNTIME_MIN", 0) * 60
     if PROXY:
-        log.info("Весь трафик идёт через прокси %s", re.sub(r"//[^@/]*@", "//***@", PROXY))
+        log.info("Общий прокси: %s", mask_proxy(PROXY))
     async with aiohttp.ClientSession(trust_env=True) as http:
         tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"))
         guardians, tasks, hedges = [], [], []

@@ -5,6 +5,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    import aiohttp  # noqa: F401
+except ImportError:   # для тестов без установленных зависимостей
+    import types
+    sys.modules["aiohttp"] = types.SimpleNamespace(ClientTimeout=lambda **k: None)
 os.environ["DRY_RUN"] = "false"
 import guardian as G  # noqa: E402
 import hedge as H     # noqa: E402
@@ -15,6 +20,7 @@ class Ex:
         self.wallet, self.venue, self.wallet_name = wallet, venue, ""
         self.label = f"#{wallet} {venue}"
         self.markets, self.account_index, self.sent = markets, 100 + wallet, []
+        self.proxy = "http://u:p@10.0.0.1:8001" if wallet == 1 else None
 
     async def market_close(self, mid, size, is_ask, worst_price):
         self.sent.append((mid, size))
@@ -90,6 +96,7 @@ def test_telegram_commands():
     assert "кошелька #2" in sent[0]
     assert "#1 RH" in sent[1] and "#2" not in sent[1]                      # /status 1 — только кошелёк 1
     assert "#1:" in sent[2] and "#2:" in sent[2]                           # /wallets
+    assert "прокси 10.0.0.1:8001" in sent[2] and "u:p" not in sent[2]     # прокси без пароля
     assert "Кошелька #9 нет" in sent[4]
     assert "Кошелёк #1" in sent[5] and "#2" not in sent[5]
     print("2. /pause N, /status N, /wallets, /pairs N работают по номеру кошелька ✓")
@@ -102,6 +109,46 @@ def test_pause_one_wallet_only():
             g.paused = True
     assert gs[0].mode("soft_stop") == "act" and gs[2].mode("soft_stop") == "alert"
     print("3. пауза одного кошелька не трогает другие ✓")
+
+
+def test_wallet_proxies():
+    for k in list(os.environ):
+        if k.startswith(("W1_", "W2_", "W3_", "RH_", "CORE_")):
+            del os.environ[k]
+    os.environ.update({
+        "W1_ADDRESS": "0xA", "W1_PROXY": "http://u1:p1@10.0.0.1:8001",
+        "W1_RH_API_PRIVATE_KEY": "k", "W1_CORE_API_PRIVATE_KEY": "k",
+        "W2_ADDRESS": "0xB", "W2_RH_API_PRIVATE_KEY": "k",
+        "W3_ADDRESS": "0xC", "W3_PROXY": "http://10.0.0.3:8003", "W3_CORE_PROXY": "http://u:p@10.0.0.33:8033",
+        "W3_RH_API_PRIVATE_KEY": "k", "W3_CORE_API_PRIVATE_KEY": "k"})
+    old = G.PROXY
+    G.PROXY = "http://g:g@10.0.0.9:8009"
+    try:
+        ws = {w["wallet"]: [e["proxy"] for e in w["exchanges"]] for w in G.wallet_configs()}
+    finally:
+        G.PROXY = old
+    assert ws[1] == ["http://u1:p1@10.0.0.1:8001"] * 2           # свой прокси на обе биржи
+    assert ws[2] == ["http://g:g@10.0.0.9:8009"]                  # своего нет — общий
+    assert ws[3] == ["http://10.0.0.3:8003", "http://u:p@10.0.0.33:8033"]  # можно и отдельно на биржу
+    assert G.mask_proxy("http://u1:p1@10.0.0.1:8001") == "10.0.0.1:8001"
+
+    # запросы идут именно через прокси кошелька
+    seen = []
+
+    class Resp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def json(self, **k): return {"code": 200, "order_book_details": []}
+
+    class Http:
+        def get(self, url, **kw):
+            seen.append((url, kw.get("proxy")))
+            return Resp()
+    ex = G.LighterExchange(Http(), "robinhood", 5, 4, "k", wallet=1, proxy="http://u1:p1@10.0.0.1:8001")
+    asyncio.run(ex.load_markets())
+    assert seen == [("https://api.rh.lighter.xyz/api/v1/orderBookDetails", "http://u1:p1@10.0.0.1:8001")]
+    print("4. у каждого кошелька свой прокси (или общий), запросы идут через него, пароль скрыт ✓")
 
 
 if __name__ == "__main__":

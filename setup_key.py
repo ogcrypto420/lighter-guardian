@@ -15,15 +15,20 @@
 import argparse
 import asyncio
 import getpass
+import os
 import sys
 
-from guardian import NETWORKS  # заодно подхватывает PROXY из .env
+from guardian import NETWORKS, mask_proxy  # заодно подхватывает .env
 
 
-async def register(lighter, network: str, eth_key: str, address: str, index: int, account: int | None):
+async def register(lighter, network: str, eth_key: str, address: str, index: int, account: int | None,
+                   proxy: str = ""):
     """Регистрирует новый API-ключ на одной бирже. Возвращает (account_index, private_key) или бросает ошибку."""
     api_url, _, chain_id, label = NETWORKS[network]
-    api = lighter.ApiClient(configuration=lighter.Configuration(host=api_url))
+    conf = lighter.Configuration(host=api_url)
+    if proxy:
+        conf.proxy = proxy
+    api = lighter.ApiClient(configuration=conf)
     try:
         if account is None:
             try:
@@ -42,6 +47,9 @@ async def register(lighter, network: str, eth_key: str, address: str, index: int
             raise RuntimeError(f"не удалось сгенерировать ключ: {err}")
         client = lighter.SignerClient(url=api_url, account_index=account,
                                       api_private_keys={index: priv}, chain_id=chain_id)
+        if proxy:
+            client.api_client.configuration.proxy = proxy
+            client.api_client.rest_client.proxy = proxy
         # nonce берём через Python-клиент SDK (он учитывает PROXY), а не внутри модуля подписи
         nonce = (await lighter.TransactionApi(api).next_nonce(account_index=account, api_key_index=index)).nonce
         _, err = await client.change_api_key(eth_private_key=eth_key, new_pubkey=pub, nonce=nonce,
@@ -75,7 +83,9 @@ async def main() -> None:
     ap.add_argument("--index", type=int, default=4, help="индекс API-ключа (по умолчанию 4)")
     ap.add_argument("--rh-account", type=int, default=None, help="account index на RH, если нужен субаккаунт")
     ap.add_argument("--core-account", type=int, default=None, help="account index на CORE, если нужен субаккаунт")
+    ap.add_argument("--proxy", default=None, help="прокси для этого кошелька: http://логин:пароль@хост:порт")
     args = ap.parse_args()
+    proxy = args.proxy if args.proxy is not None else (os.getenv(f"W{args.wallet}_PROXY") or os.getenv("PROXY") or "")
 
     if args.index in (0, 1, 2, 3, 157, 255) or not 0 <= args.index <= 254:
         sys.exit("Этот индекс занят приложениями Lighter. Возьми 4–156 или 158–254.")
@@ -91,7 +101,8 @@ async def main() -> None:
     if args.only != "rh":
         venues.append(("CORE", "testnet" if args.testnet else "mainnet", args.core_account))
 
-    print(f"\nКошелёк #{args.wallet}: {', '.join(v for v, _, _ in venues)} · индекс ключа {args.index}")
+    print(f"\nКошелёк #{args.wallet}: {', '.join(v for v, _, _ in venues)} · индекс ключа {args.index}"
+          + (f" · прокси {mask_proxy(proxy)}" if proxy else ""))
     print("Вставь приватный ключ кошелька (ввод скрыт, никуда не сохраняется):")
     eth_key = getpass.getpass("> ").strip()
     if eth_key.startswith("0x"):
@@ -103,11 +114,13 @@ async def main() -> None:
     lines = [f"{w}ADDRESS={address}"]
     if args.name:
         lines.append(f"{w}NAME={args.name}")
+    if args.proxy:
+        lines.append(f"{w}PROXY={args.proxy}")
     failed = []
     try:
         for venue, network, account in venues:
             try:
-                acc, priv = await register(lighter, network, eth_key, address, args.index, account)
+                acc, priv = await register(lighter, network, eth_key, address, args.index, account, proxy)
             except Exception as e:  # noqa: BLE001
                 failed.append(f"{venue}: {e}")
                 print(f"  ❌ {venue}: {e}")

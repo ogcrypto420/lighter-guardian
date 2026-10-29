@@ -48,6 +48,13 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(HERE / ".env")
 
+# Прокси для всего трафика стража (Lighter REST/WebSocket, подпись SDK, Telegram).
+# Формат: http://user:pass@host:port  (поддерживаются HTTP/HTTPS-прокси)
+PROXY = os.getenv("PROXY", "").strip()
+if PROXY:
+    for _k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+        os.environ[_k] = PROXY      # SDK Lighter и его модуль подписи берут прокси из окружения
+
 
 def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
@@ -481,11 +488,22 @@ class LighterExchange:
         self.signer = lighter.SignerClient(url=self.api_url, account_index=self.account_index,
                                            api_private_keys={self.api_key_index: self.api_private_key},
                                            chain_id=self.chain_id)
-        err = self.signer.check_client()
-        if err:
-            raise RuntimeError(f"API-ключ не подходит к аккаунту {self.account_index} на {self.label}: {err}")
+        await self.verify_key()
         log.info("%s: аккаунт %s, ключ %s — ок, рынков %d", self.label, self.account_index,
                  self.api_key_index, len(self.markets))
+
+    async def verify_key(self) -> None:
+        """Проверка ключа запросом с подписанным токеном (через наш HTTP-клиент — работает и через прокси)."""
+        import aiohttp
+        token = self.auth_token(600)
+        async with self.http.get(f"{self.api_url}/api/v1/accountActiveOrders",
+                                 params={"account_index": self.account_index},
+                                 headers={"authorization": token},
+                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
+            data = await r.json(content_type=None)
+        if r.status >= 400 or (isinstance(data, dict) and int(data.get("code", 200)) != 200):
+            raise RuntimeError(f"API-ключ {self.api_key_index} не подходит к аккаунту {self.account_index} "
+                               f"на {self.label}: {data}")
 
     async def load_markets(self) -> None:
         data = await self.get("orderBookDetails", filter="perp")
@@ -544,7 +562,8 @@ class LighterExchange:
         while True:
             try:
                 token = self.auth_token(3600)
-                async with self.http.ws_connect(self.ws_url, heartbeat=None, max_msg_size=0) as ws:
+                async with self.http.ws_connect(self.ws_url, heartbeat=None, max_msg_size=0,
+                                                proxy=PROXY or None) as ws:
                     acc = self.account_index
                     for ch in (f"account_all_positions/{acc}", f"account_all_orders/{acc}"):
                         await ws.send_json({"type": "subscribe", "channel": ch, "auth": token})
@@ -710,7 +729,9 @@ async def main_async() -> None:
     import aiohttp
     cfg = Config()
     max_runtime = env_float("MAX_RUNTIME_MIN", 0) * 60
-    async with aiohttp.ClientSession() as http:
+    if PROXY:
+        log.info("Весь трафик идёт через прокси %s", re.sub(r"//[^@/]*@", "//***@", PROXY))
+    async with aiohttp.ClientSession(trust_env=True) as http:
         tg = Telegram(http, env("TG_TOKEN"), env("TG_CHAT_ID"))
         guardians, tasks = [], []
         for c in exchange_configs():

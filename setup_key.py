@@ -16,7 +16,7 @@ import asyncio
 import getpass
 import sys
 
-from guardian import NETWORKS
+from guardian import NETWORKS  # заодно подхватывает PROXY из .env
 
 
 async def main() -> None:
@@ -60,14 +60,23 @@ async def main() -> None:
             sys.exit(f"Не удалось сгенерировать ключ: {err}")
         client = lighter.SignerClient(url=api_url, account_index=account_index,
                                       api_private_keys={args.index: priv}, chain_id=chain_id)
-        _, err = await client.change_api_key(eth_private_key=eth_key, new_pubkey=pub, api_key_index=args.index)
+        # nonce берём через Python-клиент SDK (он учитывает PROXY), а не внутри модуля подписи
+        nonce = (await lighter.TransactionApi(api).next_nonce(account_index=account_index,
+                                                              api_key_index=args.index)).nonce
+        _, err = await client.change_api_key(eth_private_key=eth_key, new_pubkey=pub,
+                                             nonce=nonce, api_key_index=args.index)
         if err:
             sys.exit(f"Регистрация ключа не прошла: {err}")
         print("Ключ отправлен, жду подтверждения…")
+        token, terr = client.create_auth_token_with_expiry(600, api_key_index=args.index)
+        orders_api = lighter.OrderApi(api)
         for _ in range(12):
             await asyncio.sleep(5)
-            if client.check_client() is None:
+            try:
+                await orders_api.account_active_orders(authorization=token, account_index=account_index)
                 break
+            except Exception:  # noqa: BLE001
+                continue
         else:
             sys.exit("Ключ не подтвердился за минуту. Попробуй ещё раз позже.")
         await client.close()

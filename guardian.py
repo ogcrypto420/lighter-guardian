@@ -102,7 +102,7 @@ class Config:
     soft_stop: str = env_mode("SOFT_STOP", "act")        # 3. цена за стопом, а стоп не исполнился
     naked_alert: bool = env_bool("NAKED_ALERT", True)    # 4. позиция без стопа
     hedge: str = env_mode("HEDGE", "act")                # 5. вилка RH ↔ CORE: закрыть/подрезать вторую ногу
-    hedge_debounce: float = env_float("HEDGE_DEBOUNCE_SEC", 10)
+    hedge_debounce: float = env_float("HEDGE_DEBOUNCE_SEC", 3)
     soft_stop_seconds: float = env_float("SOFT_STOP_SECONDS", 5)
     soft_stop_buffer_pct: float = env_float("SOFT_STOP_BUFFER_PCT", 0.05)
     emergency_slippage_pct: float = env_float("EMERGENCY_SLIPPAGE_PCT", 1.0)

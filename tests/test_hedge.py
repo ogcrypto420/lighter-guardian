@@ -179,7 +179,7 @@ def test_naked_suppressed_for_hedge():
 
 
 def test_ten_second_pause():
-    assert G.Config().hedge_debounce == 10                # по умолчанию — 10 секунд
+    assert G.Config().hedge_debounce == 3                 # по умолчанию — 3 секунды
     hm, gs, rh, core, msgs = setup(debounce=10)
     gs["RH"].on_positions({15: 10.0}, now=1)
     gs["CORE"].on_positions({115: -10.0}, now=1)
